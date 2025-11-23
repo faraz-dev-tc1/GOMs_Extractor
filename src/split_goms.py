@@ -1,133 +1,180 @@
-from pypdf import PdfReader, PdfWriter
-import re
 import os
+import re
+import json
+import time
+import math
+import pdfplumber
+from pypdf import PdfReader, PdfWriter
+from dotenv import load_dotenv
+import vertexai
+from vertexai.generative_models import GenerativeModel, GenerationConfig
 
+# Load environment variables
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
-input_pdf = os.path.join(project_root, "data", "Amendments_OCR.pdf")
-output_dir = os.path.join(project_root, "outputs", "split_goms")
+env_path = os.path.join(project_root, ".env")
+load_dotenv(env_path)
 
-# Create output directory
-os.makedirs(output_dir, exist_ok=True)
-
-# Load PDF
-reader = PdfReader(input_pdf)
-num_pages = len(reader.pages)
-
-print(f"📄 Total pages in PDF: {num_pages}\n")
-
-# List to store (page_number, go_number, date_string)
-goms_markers = []
-
-# ROBUST pattern that handles OCR errors where O becomes 0
-# Matches: G.O.Ms, G.0.Ms, G. O.Ms, G. 0.Ms, etc.
-go_number_pattern = re.compile(
-    r'G\.[O0]\.Ms\.No\.?\s*(\d+)',  # [O0] matches either O or 0
-    re.IGNORECASE
-)
-
-# Pattern to find date
-date_pattern = re.compile(
-    r'Dated[:\s]+([^\n]{5,25})',
-    re.IGNORECASE
-)
-
-# Pattern to find signature (End of GO)
-signature_pattern = re.compile(
-    r'BY ORDER AND IN THE NAME OF THE GOVERNOR|SECRETARY TO GOVERNMENT|SECTION OFFICER',
-    re.IGNORECASE
-)
-
-# Scan EVERY page
-for i in range(num_pages):
-    text = reader.pages[i].extract_text()
-    if not text:
-        continue
+def analyze_page_batch(pages_data: list, model: GenerativeModel) -> list:
+    """
+    Analyzes a batch of pages using Gemini to identify GO Start/End.
     
-    # Get first 800 characters (header area)
-    header_text_upper = text[:800].upper()
-    header_text_orig = text[:800]
-    
-    # Check if this looks like a GO document page
-    # Look for GO pattern with OCR variations
-    has_go_pattern = bool(re.search(r'G\.[O0]\.MS\.NO', header_text_upper))
-    has_govt_header = 'GOVERNMENT OF ANDHRA PRADESH' in header_text_upper
-    has_abstract = 'ABSTRACT' in header_text_upper
-    
-    # This is likely a new GO if it has GO pattern + government header or abstract
-    if has_go_pattern and (has_govt_header or has_abstract):
-        # Extract GO number from original text
-        go_match = go_number_pattern.search(header_text_orig)
+    Args:
+        pages_data: List of tuples (page_num, text)
+        model: Initialized Gemini model
         
-        if go_match:
-            go_num = go_match.group(1)
-            
-            # Try to extract date
-            date_match = date_pattern.search(header_text_orig)
-            if date_match:
-                date_str = date_match.group(1).strip()
-                # Clean up date - remove extra text
-                date_str = re.split(r'\s{2,}|\n', date_str)[0]
-                date_clean = re.sub(r'[^\d\-A-Za-z]', '-', date_str)[:20]
-            else:
-                date_clean = "no-date"
-            
-            goms_markers.append((i, go_num, date_clean))
-            print(f"✓ Found G.O.Ms.No.{go_num} on page {i + 1} (date: {date_str if date_match else 'not found'})")
+    Returns:
+        List of dicts with classification results
+    """
+    prompt_text = ""
+    for page_num, text in pages_data:
+        # Limit text per page to avoid context limits, header/footer usually enough
+        clean_text = text[:1500].replace("\n", " ") if text else "NO TEXT"
+        prompt_text += f"--- PAGE {page_num + 1} ---\n{clean_text}\n\n"
 
-print(f"\n📊 Total GOs found: {len(goms_markers)}\n")
+    prompt = f"""Analyze the following pages from a Government Order (GO) document bundle.
+For EACH page, determine:
+1. Is it the START of a new GO? (Look for "G.O.Ms.No", "GOVERNMENT OF...", "ABSTRACT")
+2. Is it the END of a GO? (Look for "BY ORDER AND IN THE NAME OF THE GOVERNOR", "SECTION OFFICER", "SECRETARY TO GOVERNMENT")
+3. If it's a START, extract the GOMs Number.
 
-if not goms_markers:
-    raise RuntimeError("❌ No G.O.Ms. detected! Check PDF format.")
+PAGES:
+{prompt_text}
 
-# Create page ranges
-print("📑 GO Page Ranges:")
-page_ranges = []
-for idx, (start_page, goms_num, date_clean) in enumerate(goms_markers):
-    # Determine the maximum possible end page (before next GO starts)
-    if idx == len(goms_markers) - 1:
-        max_end_page = num_pages - 1
-    else:
-        max_end_page = goms_markers[idx + 1][0] - 1
+Respond with a JSON LIST of objects, one for each page:
+[
+  {{
+    "page": <page_number>,
+    "is_start": true/false,
+    "is_end": true/false,
+    "goms_no": "number or null"
+  }},
+  ...
+]
+"""
     
-    # Scan pages from start_page to max_end_page to find signature
-    actual_end_page = max_end_page
-    
-    for p in range(start_page, max_end_page + 1):
-        text = reader.pages[p].extract_text()
-        if not text: continue
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config=GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.1
+            )
+        )
+        return json.loads(response.text)
+    except Exception as e:
+        print(f"⚠️ Batch analysis failed: {e}")
+        # Return empty results for this batch to avoid crashing
+        return [{"page": p[0] + 1, "is_start": False, "is_end": False, "goms_no": None} for p in pages_data]
+
+def main():
+    input_pdf = os.path.join(project_root, "data", "Amendments_OCR.pdf")
+    output_dir = os.path.join(project_root, "outputs", "split_goms")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Initialize Gemini
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if not project_id:
+        print("❌ GOOGLE_CLOUD_PROJECT not set.")
+        return
         
-        # Check for signature at the bottom of the page (last 1000 chars)
-        if signature_pattern.search(text[-1000:]):
-            actual_end_page = p
-            break
-    
-    num_pages_in_go = actual_end_page - start_page + 1
-    page_ranges.append((start_page, actual_end_page, goms_num, date_clean))
-    print(f"   GO {goms_num:>3}: pages {start_page+1:>2}-{actual_end_page+1:>2} ({num_pages_in_go} page{'s' if num_pages_in_go > 1 else ''})")
+    vertexai.init(project=project_id, location="asia-south1")
+    model = GenerativeModel("gemini-2.0-flash-exp")
 
-# Split and save
-print("\n💾 Splitting PDFs...")
-for start, end, num, date in page_ranges:
-    writer = PdfWriter()
-    
-    for p in range(start, end + 1):
-        writer.add_page(reader.pages[p])
-    
-    # Create safe filename
-    filename = f"GO_{num}_Dated_{date}.pdf"
-    filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
-    output_path = os.path.join(output_dir, filename)
-    
-    with open(output_path, "wb") as f:
-        writer.write(f)
-    
-    print(f"   ✓ {filename}")
+    # Load PDF
+    print(f"📄 Loading PDF: {input_pdf}")
+    reader = PdfReader(input_pdf)
+    num_pages = len(reader.pages)
+    print(f"   Total pages: {num_pages}")
 
-print(f"\n✅ Successfully split into {len(page_ranges)} GO files!")
-print(f"📁 Output directory: {output_dir}")
+    # Extract text for all pages first (faster than doing it in loop)
+    print("\n📖 Extracting text...")
+    all_pages_text = []
+    with pdfplumber.open(input_pdf) as pdf:
+        for i, page in enumerate(pdf.pages):
+            all_pages_text.append((i, page.extract_text() or ""))
 
-# Summary by page count
-single_page = sum(1 for s, e, _, _ in page_ranges if e - s == 0)
-multi_page = len(page_ranges) - single_page
-print(f"\n📈 Summary: {single_page} single-page GOs, {multi_page} multi-page GOs")
+    # Process in batches
+    BATCH_SIZE = 10
+    results = []
+    
+    print(f"\n🤖 Analyzing pages with Gemini (Batch size: {BATCH_SIZE})...")
+    total_batches = math.ceil(num_pages / BATCH_SIZE)
+    
+    for i in range(0, num_pages, BATCH_SIZE):
+        batch = all_pages_text[i : i + BATCH_SIZE]
+        print(f"   Processing batch {i//BATCH_SIZE + 1}/{total_batches} (Pages {batch[0][0]+1}-{batch[-1][0]+1})...", end="", flush=True)
+        
+        batch_results = analyze_page_batch(batch, model)
+        results.extend(batch_results)
+        print(" ✓")
+        time.sleep(10) # Rate limiting for quota
+
+    # Build Index
+    print("\n📑 Building Index...")
+    go_index = []
+    current_go = None
+    
+    for res in results:
+        page_num = res.get("page")
+        is_start = res.get("is_start")
+        is_end = res.get("is_end")
+        goms_no = res.get("goms_no")
+        
+        # Start of new GO
+        if is_start:
+            # If previous GO was open, close it at previous page
+            if current_go:
+                current_go["end_page"] = page_num - 2 # 0-indexed, previous page
+                go_index.append(current_go)
+            
+            current_go = {
+                "goms_no": goms_no or "Unknown",
+                "start_page": page_num - 1, # 0-indexed
+                "end_page": None # Will be set later
+            }
+        
+        # End of GO
+        if is_end and current_go:
+            current_go["end_page"] = page_num - 1 # 0-indexed
+            go_index.append(current_go)
+            current_go = None
+            
+    # Handle last GO if still open
+    if current_go:
+        current_go["end_page"] = num_pages - 1
+        go_index.append(current_go)
+
+    print(f"   Found {len(go_index)} GOs.")
+
+    # Split Files
+    print("\n💾 Splitting PDFs...")
+    for go in go_index:
+        start = go["start_page"]
+        end = go["end_page"]
+        num = go["goms_no"]
+        
+        # Validate range
+        if start > end:
+            print(f"   ⚠️ Invalid range for GO {num}: {start+1}-{end+1}. Skipping.")
+            continue
+            
+        writer = PdfWriter()
+        for p in range(start, end + 1):
+            writer.add_page(reader.pages[p])
+        
+        # Sanitize GO number for filename
+        clean_num = re.sub(r'[^\w\d-]', '', num.replace("G.O.Ms.No.", "").strip())
+        filename = f"GO_{clean_num}_Pages_{start+1}-{end+1}.pdf"
+        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        output_path = os.path.join(output_dir, filename)
+        
+        with open(output_path, "wb") as f:
+            writer.write(f)
+        
+        print(f"   ✓ {filename}")
+
+    print(f"\n✅ Successfully split into {len(go_index)} files!")
+
+if __name__ == "__main__":
+    main()
