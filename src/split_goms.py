@@ -2,8 +2,10 @@ from pypdf import PdfReader, PdfWriter
 import re
 import os
 
-input_pdf = "../data/Amendments_OCR.pdf"
-output_dir = "../outputs/split_goms"
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)
+input_pdf = os.path.join(project_root, "data", "Amendments_OCR.pdf")
+output_dir = os.path.join(project_root, "outputs", "split_goms")
 
 # Create output directory
 os.makedirs(output_dir, exist_ok=True)
@@ -27,6 +29,12 @@ go_number_pattern = re.compile(
 # Pattern to find date
 date_pattern = re.compile(
     r'Dated[:\s]+([^\n]{5,25})',
+    re.IGNORECASE
+)
+
+# Pattern to find signature (End of GO)
+signature_pattern = re.compile(
+    r'BY ORDER AND IN THE NAME OF THE GOVERNOR|SECRETARY TO GOVERNMENT|SECTION OFFICER',
     re.IGNORECASE
 )
 
@@ -76,14 +84,27 @@ if not goms_markers:
 print("📑 GO Page Ranges:")
 page_ranges = []
 for idx, (start_page, goms_num, date_clean) in enumerate(goms_markers):
+    # Determine the maximum possible end page (before next GO starts)
     if idx == len(goms_markers) - 1:
-        end_page = num_pages - 1
+        max_end_page = num_pages - 1
     else:
-        end_page = goms_markers[idx + 1][0] - 1
+        max_end_page = goms_markers[idx + 1][0] - 1
     
-    num_pages_in_go = end_page - start_page + 1
-    page_ranges.append((start_page, end_page, goms_num, date_clean))
-    print(f"   GO {goms_num:>3}: pages {start_page+1:>2}-{end_page+1:>2} ({num_pages_in_go} page{'s' if num_pages_in_go > 1 else ''})")
+    # Scan pages from start_page to max_end_page to find signature
+    actual_end_page = max_end_page
+    
+    for p in range(start_page, max_end_page + 1):
+        text = reader.pages[p].extract_text()
+        if not text: continue
+        
+        # Check for signature at the bottom of the page (last 1000 chars)
+        if signature_pattern.search(text[-1000:]):
+            actual_end_page = p
+            break
+    
+    num_pages_in_go = actual_end_page - start_page + 1
+    page_ranges.append((start_page, actual_end_page, goms_num, date_clean))
+    print(f"   GO {goms_num:>3}: pages {start_page+1:>2}-{actual_end_page+1:>2} ({num_pages_in_go} page{'s' if num_pages_in_go > 1 else ''})")
 
 # Split and save
 print("\n💾 Splitting PDFs...")
