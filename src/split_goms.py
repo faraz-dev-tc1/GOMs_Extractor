@@ -79,7 +79,7 @@ def main():
         return
         
     vertexai.init(project=project_id, location="asia-south1")
-    model = GenerativeModel("gemini-2.0-flash-exp")
+    model = GenerativeModel("gemini-2.5-flash")
 
     # Load PDF
     print(f"📄 Loading PDF: {input_pdf}")

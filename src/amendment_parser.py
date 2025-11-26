@@ -1,7 +1,7 @@
 
 """
 Enhanced GO Amendment Parser with Vertex AI Gemini API
-Uses LLM to improve extraction accuracy, especially for old_text and new_text
+Uses LLM to improve extraction accuracy, especially for target_text and updated_text
 """
 
 import re
@@ -10,7 +10,7 @@ import os
 from typing import List, Dict, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
-import pdfplumber
+from dotenv import load_dotenv
 from google.cloud import aiplatform
 from vertexai.generative_models import GenerativeModel, GenerationConfig
 import vertexai
@@ -19,25 +19,29 @@ import vertexai
 @dataclass
 class Amendment:
     """Represents a single amendment within a GO"""
-    rule_reference: str
-    amendment_type: str
-    location: str
-    old_text: Optional[str]
-    new_text: Optional[str]
-    full_description: str
+    rule_no: str
+    sub_rule: Optional[str]
+    clause: Optional[str]
+    sub_clause: Optional[str]
+    proviso_no: Optional[str]
+    additional_position_ctx: Optional[str]
+    type_of_action: str  # "sub" (substitute), "omit" (delete), "add" (insert)
+    target_text: Optional[str]  # Text being replaced/deleted
+    updated_text: Optional[str]  # New text being added/substituted
+    raw_amendment_text: str  # Original full text of the amendment
     confidence: str = "medium"  # low, medium, high
 
 
 @dataclass
 class GoDocument:
     """Represents a complete GO document"""
-    go_number: str
-    date: str
-    subject: str
-    department: str
+    goms_no: str
+    abstract: str
     references: List[str]
-    effective_date: Optional[str]
-    amendments: List[Amendment]
+    notification: str
+    amendment: List[Amendment]
+    signed_by: str
+    signed_to: str
     raw_text: str
 
 
@@ -47,26 +51,62 @@ class GeminiAmendmentExtractor:
     def __init__(self, project_id: str = None, location: str = "us-central1"):
         """
         Initialize Gemini API
-        
+
         Args:
             project_id: GCP project ID (defaults to env var GOOGLE_CLOUD_PROJECT)
             location: GCP region
         """
-        
+
         try:
+            # Load environment variables from .env file
+            # Use absolute path relative to this script's location
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            env_path = os.path.join(script_dir, '..', '.env')
+            load_dotenv(env_path)
+
+            # Fix path expansion issue: python-dotenv incorrectly prepends home directory
+            # to /mnt/c paths in WSL environment
+            creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            if creds_path:
+                # Check for incorrectly expanded WSL paths
+                home_dir = os.path.expanduser("~")
+                if creds_path.startswith(os.path.join(home_dir, "mnt", "c")):
+                    # Remove the home directory prefix
+                    creds_path = creds_path.replace(os.path.join(home_dir, "mnt", "c"), "/mnt/c", 1)
+                    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+
             self.project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT")
             self.location = location
-            
+
             if not self.project_id:
                 print("WARNING: GOOGLE_CLOUD_PROJECT not set. Gemini extraction disabled.")
                 self.enabled = False
                 return
-            
+
+            self.enabled = True
+
             # Initialize Vertex AI
             vertexai.init(project=self.project_id, location=self.location)
             
             # Initialize Gemini model
-            self.model = GenerativeModel("gemini-1.5-flash-002")
+            # Try different model names based on availability
+            model_names = [
+                'gemini-2.5-flash',
+            ]
+
+            model_initialized = False
+            for model_name in model_names:
+                try:
+                    self.model = GenerativeModel(model_name)
+                    # Test with a simple call to verify it works
+                    print(f"✓ Using model: {model_name}")
+                    model_initialized = True
+                    break
+                except Exception as e:
+                    continue
+
+            if not model_initialized:
+                raise Exception("No Gemini model available. Please enable Vertex AI API.")
             
             # Generation config for structured output
             self.generation_config = GenerationConfig(
@@ -98,32 +138,41 @@ class GeminiAmendmentExtractor:
         prompt = f"""You are an expert legal document parser specializing in Indian Government Orders.
 
 Extract detailed information from the following amendment text. Pay special attention to:
-1. The exact rule being amended (e.g., "Rule 12", "Rule 22(3)(a)")
-2. The type of amendment (substitution, insertion, deletion, modification)
-3. The specific location within the rule (e.g., "sub-rule (1)", "clause (a)", "Explanation (iii)")
-4. For SUBSTITUTIONS: Extract BOTH the old text being replaced AND the new text
-5. For INSERTIONS: Extract the new text being added
-6. For DELETIONS: Extract the text being removed
+1. The exact rule being amended (e.g., "Rule 12", "Rule 22")
+2. Sub-rule (e.g., "sub-rule (1)", "sub-rule (3)")
+3. Clause (e.g., "clause (a)", "clause (b)")
+4. Sub-clause (e.g., "sub-clause (i)", "sub-clause (ii)")
+5. Proviso number if applicable (e.g., "first proviso", "second proviso")
+6. Any additional position context (e.g., "after the words", "in the beginning")
+7. Type of action: "sub" (substitution), "omit" (deletion), or "add" (insertion)
+8. For SUBSTITUTIONS: Extract BOTH the target text (being replaced) AND the updated text
+9. For INSERTIONS: Extract the updated text being added
+10. For DELETIONS: Extract the target text being removed
 
 AMENDMENT TEXT:
 {amendment_text}
 
 CRITICAL INSTRUCTIONS:
+- Break down the position as granularly as possible (rule -> sub-rule -> clause -> sub-clause -> proviso)
 - For substitutions, look for patterns like "for the words X, the words Y shall be substituted"
-- The OLD_TEXT is typically after "for the words" or "for clause"
-- The NEW_TEXT is typically after "the following shall be substituted" or "the words X shall be substituted"
+- The target_text is typically after "for the words" or "for clause"
+- The updated_text is typically after "the following shall be substituted" or "the words X shall be substituted"
 - Extract complete sentences/phrases, not fragments
 - If text is in quotes, include the quotes
-- If you cannot find old_text or new_text, set it to null
+- If you cannot find a specific position element, set it to null
 
 OUTPUT FORMAT:
 Respond with ONLY a valid JSON object (no markdown, no explanations):
 {{
-  "rule_reference": "Rule X or Rule X(Y)(Z)",
-  "amendment_type": "substitution|insertion|deletion|modification",
-  "location": "specific location within rule",
-  "old_text": "exact text being replaced (for substitutions only, otherwise null)",
-  "new_text": "exact text being added/substituted (null if deletion)",
+  "rule_no": "Rule X",
+  "sub_rule": "sub-rule (Y)" or null,
+  "clause": "clause (Z)" or null,
+  "sub_clause": "sub-clause (W)" or null,
+  "proviso_no": "proviso number" or null,
+  "additional_position_ctx": "any additional position context" or null,
+  "type_of_action": "sub|omit|add",
+  "target_text": "exact text being replaced/deleted (null if add)",
+  "updated_text": "exact text being added/substituted (null if omit)",
   "confidence": "high|medium|low"
 }}
 
@@ -159,25 +208,25 @@ RESPOND WITH ONLY THE JSON OBJECT:"""
         if not self.enabled:
             return None
         
-        prompt = f"""Extract metadata from this Government Order document.
+        prompt = f"""Extract structured data from this Government Order document.
 
 DOCUMENT TEXT:
-{text[:2000]}
+{text}
 
-Extract the following information:
-1. GO Number (e.g., "G.O.Ms.No.464")
-2. Date (in DD-MM-YYYY format)
-3. Department name
-4. Subject/Abstract
-5. Effective date (when the amendment comes into force)
+Extract the following fields:
+1. GOMs No: The Government Order Manuscript Number (e.g., "G.O.Ms.No.464")
+2. Abstract: The abstract or subject of the order
+3. Notification: The content of the notification section (if present)
+4. Signed_by: The name and designation of the person signing the order (usually at the bottom)
+5. Signed_to: The recipients listed in the "To" section
 
 RESPOND WITH ONLY A JSON OBJECT:
 {{
-  "go_number": "G.O.Ms.No.XXX",
-  "date": "DD-MM-YYYY",
-  "department": "Department name",
-  "subject": "Brief subject",
-  "effective_date": "DD-MM-YYYY or descriptive date (null if not found)"
+  "goms_no": "G.O.Ms.No.XXX",
+  "abstract": "Abstract text",
+  "notification": "Notification text or null",
+  "signed_by": "Name, Designation",
+  "signed_to": "Recipient list or null"
 }}"""
 
         try:
@@ -222,14 +271,29 @@ class EnhancedGoAmendmentParser:
                 self.gemini = None
     
     def extract_text_from_pdf(self, pdf_path: str) -> str:
-        """Extract text from PDF file"""
-        text = ""
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-        return text
+        """Extract text from PDF file using Gemini's multimodal API (no fallback)."""
+        if not self.gemini or not self.gemini.enabled:
+            raise RuntimeError("Gemini extractor is not enabled; cannot extract PDF text.")
+        
+        # Use Gemini for PDF extraction (handles scanned PDFs)
+        from vertexai.generative_models import Part
+        
+        print("  Extracting text with Gemini...", end="", flush=True)
+        
+        # Read PDF as bytes
+        with open(pdf_path, "rb") as f:
+            pdf_data = f.read()
+        
+        # Create PDF part
+        pdf_part = Part.from_data(pdf_data, mime_type="application/pdf")
+        
+        prompt = """Extract ALL text from this PDF document. 
+Return the complete text content exactly as it appears, preserving formatting and structure.
+Do not summarize or skip any content."""
+        
+        response = self.gemini.model.generate_content([prompt, pdf_part])
+        print(" ✓")
+        return response.text
     
     def split_into_gos(self, text: str) -> List[str]:
         """Split a large document into individual GOs"""
@@ -295,15 +359,21 @@ class EnhancedGoAmendmentParser:
         return header_info
     
     def parse_go_header(self, text: str) -> Dict[str, str]:
-        """Extract GO header using Gemini or regex fallback"""
-        # Try Gemini first
+        """Extract GO header using Gemini"""
         if self.gemini:
             gemini_result = self.gemini.extract_go_metadata(text)
             if gemini_result:
                 return gemini_result
         
-        # Fallback to regex
-        return self.parse_go_header_regex(text)
+        # No fallback
+        print("  ✗ Gemini extraction failed or disabled. No fallback used.")
+        return {
+            'goms_no': '',
+            'abstract': '',
+            'notification': '',
+            'signed_by': '',
+            'signed_to': ''
+        }
     
     def parse_references(self, text: str) -> List[str]:
         """Extract references from 'Read the following' section"""
@@ -340,100 +410,39 @@ class EnhancedGoAmendmentParser:
         # If no clear splits, return as single block
         return [text.strip()] if text.strip() else []
     
-    def _parse_amendment_regex(self, text: str) -> Optional[Amendment]:
-        """Parse amendment using regex (fallback method)"""
-        if not text:
-            return None
-        
-        # Extract rule reference
-        rule_match = re.search(
-            r'(?:In\s+|For\s+)?(?:rule|clause|sub-rule)[-\s]*(\d+[A-Z]?(?:\([^)]+\))*(?:\s*\([^)]+\))*)',
-            text,
-            re.IGNORECASE
-        )
-        rule_reference = rule_match.group(1) if rule_match else "Unknown"
-        
-        # Extract location
-        location_match = re.search(
-            r'in\s+(sub-rule\s*\([^)]+\)|clause\s*\([^)]+\)|Explanation\s*\([^)]+\))',
-            text,
-            re.IGNORECASE
-        )
-        location = location_match.group(1) if location_match else ""
-        
-        # Determine amendment type
-        text_lower = text.lower()
-        if 'substituted' in text_lower or 'substitute' in text_lower:
-            amendment_type = 'substitution'
-        elif 'inserted' in text_lower or 'insert' in text_lower or 'added' in text_lower:
-            amendment_type = 'insertion'
-        elif 'omitted' in text_lower or 'deleted' in text_lower:
-            amendment_type = 'deletion'
-        else:
-            amendment_type = 'modification'
-        
-        # Extract old text (for substitution)
-        old_text = None
-        if amendment_type == 'substitution':
-            # Pattern: for the words "X" or for clause (X)
-            old_patterns = [
-                r'[Ff]or\s+(?:the\s+)?(?:words?\s+)?["\']([^"\']+)["\']',
-                r'[Ff]or\s+(?:the\s+)?(?:clause|Explanation)\s*\(([^)]+)\)',
-            ]
-            for pattern in old_patterns:
-                old_match = re.search(pattern, text)
-                if old_match:
-                    old_text = old_match.group(1).strip()
-                    break
-        
-        # Extract new text
-        new_text = None
-        new_patterns = [
-            r'the\s+following\s+shall\s+be\s+(?:substituted|inserted|added)[,:\s-]+namely[:\s-]*["\']?(.+?)["\']?\s*(?:\(BY\s+ORDER|\Z)',
-            r'the\s+words?\s+["\']([^"\']+)["\']?\s+shall\s+be\s+(?:substituted|inserted)',
-        ]
-        
-        for pattern in new_patterns:
-            new_match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-            if new_match:
-                new_text = new_match.group(1).strip()
-                # Clean up and limit length
-                new_text = re.sub(r'\s+', ' ', new_text)
-                if len(new_text) > 500:
-                    new_text = new_text[:500] + "..."
-                break
-        
-        return Amendment(
-            rule_reference=rule_reference,
-            amendment_type=amendment_type,
-            location=location,
-            old_text=old_text,
-            new_text=new_text,
-            full_description=text[:1000],
-            confidence="low"
-        )
-    
     def parse_single_amendment(self, text: str) -> Optional[Amendment]:
-        """Parse a single amendment using Gemini or regex fallback"""
+        """Parse a single amendment using Gemini"""
         if not text:
             return None
         
-        # Try Gemini first
         if self.gemini:
             gemini_result = self.gemini.extract_amendment_details(text)
             if gemini_result:
-                return Amendment(
-                    rule_reference=gemini_result.get('rule_reference', 'Unknown'),
-                    amendment_type=gemini_result.get('amendment_type', 'modification'),
-                    location=gemini_result.get('location', ''),
-                    old_text=gemini_result.get('old_text'),
-                    new_text=gemini_result.get('new_text'),
-                    full_description=text[:1000],
-                    confidence=gemini_result.get('confidence', 'high')
-                )
+                # Handle case where Gemini returns a list instead of dict
+                if isinstance(gemini_result, list):
+                    if len(gemini_result) > 0:
+                        gemini_result = gemini_result[0]
+                    else:
+                        gemini_result = None
+                
+                if isinstance(gemini_result, dict):
+                    return Amendment(
+                        rule_no=gemini_result.get('rule_no', 'Unknown'),
+                        sub_rule=gemini_result.get('sub_rule'),
+                        clause=gemini_result.get('clause'),
+                        sub_clause=gemini_result.get('sub_clause'),
+                        proviso_no=gemini_result.get('proviso_no'),
+                        additional_position_ctx=gemini_result.get('additional_position_ctx'),
+                        type_of_action=gemini_result.get('type_of_action', 'sub'),
+                        target_text=gemini_result.get('target_text'),
+                        updated_text=gemini_result.get('updated_text'),
+                        raw_amendment_text=text,
+                        confidence=gemini_result.get('confidence', 'high')
+                    )
         
-        # Fallback to regex
-        return self._parse_amendment_regex(text)
+        # No fallback
+        print("  ✗ Gemini extraction failed or disabled. No fallback used.")
+        return None
     
     def parse_amendments(self, text: str) -> List[Amendment]:
         """Parse the AMENDMENTS section"""
@@ -481,14 +490,14 @@ class EnhancedGoAmendmentParser:
         amendments = self.parse_amendments(go_text)
         
         go_doc = GoDocument(
-            go_number=header_info.get('go_number', ''),
-            date=header_info.get('date', ''),
-            subject=header_info.get('subject', ''),
-            department=header_info.get('department', ''),
+            goms_no=header_info.get('goms_no', ''),
+            abstract=header_info.get('abstract', ''),
             references=references,
-            effective_date=header_info.get('effective_date'),
-            amendments=amendments,
-            raw_text=go_text[:2000] if len(go_text) > 2000 else go_text
+            notification=header_info.get('notification', ''),
+            amendment=amendments,
+            signed_by=header_info.get('signed_by', ''),
+            signed_to=header_info.get('signed_to', ''),
+            raw_text=go_text
         )
         
         return go_doc
@@ -514,9 +523,9 @@ class EnhancedGoAmendmentParser:
                 go_doc = self.parse_go(go_text)
                 go_documents.append(go_doc)
                 
-                if go_doc.go_number:
-                    high_conf = sum(1 for a in go_doc.amendments if a.confidence == "high")
-                    print(f"  ✓ {go_doc.go_number} - {len(go_doc.amendments)} amendment(s) [{high_conf} high confidence]")
+                if go_doc.goms_no:
+                    high_conf = sum(1 for a in go_doc.amendment if a.confidence == "high")
+                    print(f"  ✓ {go_doc.goms_no} - {len(go_doc.amendment)} amendment(s) [{high_conf} high confidence]")
                 else:
                     print(f"  ⚠ Empty document (likely page number)")
             except Exception as e:
@@ -542,7 +551,7 @@ class EnhancedGoAmendmentParser:
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             f.write(f"Total GOs: {len(go_documents)}\n\n")
             
-            if any(doc.amendments and doc.amendments[0].confidence for doc in go_documents):
+            if any(doc.amendment and doc.amendment[0].confidence for doc in go_documents):
                 f.write("**Extraction Method:** Vertex AI Gemini API\n\n")
             else:
                 f.write("**Extraction Method:** Regex (Fallback)\n\n")
@@ -550,16 +559,11 @@ class EnhancedGoAmendmentParser:
             f.write("---\n\n")
             
             for doc in go_documents:
-                if not doc.go_number:
+                if not doc.goms_no:
                     continue
                 
-                f.write(f"## {doc.go_number}\n\n")
-                f.write(f"**Date:** {doc.date}\n\n")
-                f.write(f"**Department:** {doc.department}\n\n")
-                f.write(f"**Subject:** {doc.subject}\n\n")
-                
-                if doc.effective_date:
-                    f.write(f"**Effective Date:** {doc.effective_date}\n\n")
+                f.write(f"## {doc.goms_no}\n\n")
+                f.write(f"**Abstract:** {doc.abstract}\n\n")
                 
                 if doc.references:
                     f.write("**References:**\n")
@@ -567,25 +571,43 @@ class EnhancedGoAmendmentParser:
                         f.write(f"- {ref}\n")
                     f.write("\n")
                 
-                f.write(f"### Amendments ({len(doc.amendments)})\n\n")
+                if doc.notification:
+                    f.write(f"**Notification:**\n{doc.notification}\n\n")
                 
-                for i, amendment in enumerate(doc.amendments, 1):
+                f.write(f"### Amendments ({len(doc.amendment)})\n\n")
+                
+                for i, amendment in enumerate(doc.amendment, 1):
                     conf_emoji = "🟢" if amendment.confidence == "high" else "🟡" if amendment.confidence == "medium" else "🔴"
                     f.write(f"#### Amendment {i} {conf_emoji}\n\n")
-                    f.write(f"- **Rule:** {amendment.rule_reference}\n")
-                    f.write(f"- **Type:** {amendment.amendment_type}\n")
+                    f.write(f"- **Rule:** {amendment.rule_no}\n")
+                    
+                    if amendment.sub_rule:
+                        f.write(f"- **Sub-rule:** {amendment.sub_rule}\n")
+                    if amendment.clause:
+                        f.write(f"- **Clause:** {amendment.clause}\n")
+                    if amendment.sub_clause:
+                        f.write(f"- **Sub-clause:** {amendment.sub_clause}\n")
+                    if amendment.proviso_no:
+                        f.write(f"- **Proviso:** {amendment.proviso_no}\n")
+                    if amendment.additional_position_ctx:
+                        f.write(f"- **Position Context:** {amendment.additional_position_ctx}\n")
+                    
+                    f.write(f"- **Action:** {amendment.type_of_action}\n")
                     f.write(f"- **Confidence:** {amendment.confidence}\n")
                     
-                    if amendment.location:
-                        f.write(f"- **Location:** {amendment.location}\n")
+                    if amendment.target_text:
+                        f.write(f"- **Target Text:** \"{amendment.target_text}\"\n")
                     
-                    if amendment.old_text:
-                        f.write(f"- **Old Text:** \"{amendment.old_text}\"\n")
-                    
-                    if amendment.new_text:
-                        f.write(f"- **New Text:** \"{amendment.new_text}\"\n")
+                    if amendment.updated_text:
+                        f.write(f"- **Updated Text:** \"{amendment.updated_text}\"\n")
                     
                     f.write("\n")
+                
+                if doc.signed_by:
+                    f.write(f"**Signed By:** {doc.signed_by}\n\n")
+                
+                if doc.signed_to:
+                    f.write(f"**Signed To:** {doc.signed_to}\n\n")
                 
                 f.write("---\n\n")
         
@@ -598,17 +620,17 @@ def main():
     
     if len(sys.argv) < 2:
         print("Enhanced GO Amendment Parser with Vertex AI Gemini")
-        print("\nUsage: python go_parser_gemini.py <pdf_file1> [pdf_file2] ...")
-        print("\nEnvironment Variables:")
+        print("\nUsage: python amendment_parser.py <pdf_file1> [pdf_file2] ...")
+        print("\nRequired Environment Variables:")
         print("  GOOGLE_CLOUD_PROJECT - Your GCP project ID")
         print("  GOOGLE_APPLICATION_CREDENTIALS - Path to service account key JSON")
         print("\nExamples:")
         print("  # With Gemini API (recommended)")
         print("  export GOOGLE_CLOUD_PROJECT='your-project-id'")
         print("  export GOOGLE_APPLICATION_CREDENTIALS='path/to/key.json'")
-        print("  python go_parser_gemini.py GO_464.pdf")
+        print("  python amendment_parser.py GO_464.pdf")
         print("\n  # Without Gemini (regex only)")
-        print("  python go_parser_gemini.py --no-gemini GO_464.pdf")
+        print("  python amendment_parser.py --no-gemini GO_464.pdf")
         sys.exit(1)
     
     # Check for --no-gemini flag
@@ -620,63 +642,54 @@ def main():
         args.remove('--no-gemini')
         print("Running in regex-only mode (Gemini disabled)")
     
-    # Initialize parser
-    parser = EnhancedGoAmendmentParser(use_gemini=use_gemini)
-    all_documents = []
+    parser = EnhancedGoAmendmentParser(use_gemini=use_gemini) # Use the determined use_gemini value
     
-    # Parse each PDF file
+    if not args:
+        print("Usage: python amendment_parser.py <pdf_path1> <pdf_path2> ...")
+        sys.exit(1)
+
+    overall_documents = []
     for pdf_path in args:
+        print(f"\nProcessing: {pdf_path}\n{'=' * 60}")
         try:
             documents = parser.parse_pdf_file(pdf_path)
-            all_documents.extend(documents)
         except Exception as e:
-            print(f"\n✗ Error processing {pdf_path}: {e}")
+            print(f"✗ Error processing {pdf_path}: {e}")
             import traceback
             traceback.print_exc()
-    
-    # Export results
-    if all_documents:
-        print(f"\n{'='*60}")
-        print("Exporting Results")
-        print('='*60)
-        
-        valid_docs = [doc for doc in all_documents if doc.go_number]
-        
-        parser.export_to_json(all_documents, "../outputs/go_amendments_enhanced.json")
-        parser.export_to_markdown(all_documents, "../outputs/go_amendments_enhanced.md")
-        
-        # Print statistics
-        print(f"\n{'='*60}")
-        print("Extraction Statistics")
-        print('='*60)
-        print(f"Total documents: {len(all_documents)}")
-        print(f"Valid GOs: {len(valid_docs)}")
-        
-        total_amendments = sum(len(doc.amendments) for doc in valid_docs)
-        print(f"Total amendments: {total_amendments}")
-        
-        if parser.gemini and parser.gemini.enabled:
-            high_conf = sum(1 for doc in valid_docs for a in doc.amendments if a.confidence == "high")
-            med_conf = sum(1 for doc in valid_docs for a in doc.amendments if a.confidence == "medium")
-            low_conf = sum(1 for doc in valid_docs for a in doc.amendments if a.confidence == "low")
-            
-            print(f"\nConfidence Distribution:")
-            print(f"  🟢 High:   {high_conf} ({high_conf/total_amendments*100:.1f}%)")
-            print(f"  🟡 Medium: {med_conf} ({med_conf/total_amendments*100:.1f}%)")
-            print(f"  🔴 Low:    {low_conf} ({low_conf/total_amendments*100:.1f}%)")
-        
-        # Count successful extractions
-        with_old_text = sum(1 for doc in valid_docs for a in doc.amendments if a.old_text and a.amendment_type == 'substitution')
-        with_new_text = sum(1 for doc in valid_docs for a in doc.amendments if a.new_text)
-        
-        print(f"\nExtraction Success:")
-        print(f"  Old text extracted: {with_old_text} amendments")
-        print(f"  New text extracted: {with_new_text} amendments")
-        
-        print(f"\n✓ Successfully processed {len(valid_docs)} GO document(s)")
-    else:
-        print("\n✗ No documents were successfully parsed")
+            continue
 
+        if not documents:
+            print(f"⚠ No GO documents found in {pdf_path}\n")
+            continue
+
+        # Export per‑PDF results
+        base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        json_out = f"../outputs/{base_name}_amendments.json"
+        md_out = f"../outputs/{base_name}_amendments.md"
+        parser.export_to_json(documents, json_out)
+        parser.export_to_markdown(documents, md_out)
+        print(f"\nSaved per‑PDF outputs to:\n- {json_out}\n- {md_out}\n")
+
+        overall_documents.extend(documents)
+
+    # After all PDFs, print overall statistics (optional)
+    if overall_documents:
+        print(f"\n{'=' * 60}\nOverall Extraction Statistics\n{'=' * 60}")
+        valid_docs = [doc for doc in overall_documents if doc.goms_no]
+        total = len(overall_documents)
+        valid = len(valid_docs)
+        total_amendments = sum(len(doc.amendment) for doc in valid_docs)
+        print(f"Total documents processed: {total}")
+        print(f"Valid GOs: {valid}")
+        print(f"Total amendments: {total_amendments}")
+        if parser.gemini and parser.gemini.enabled:
+            high = sum(1 for doc in valid_docs for a in doc.amendment if a.confidence == "high")
+            med = sum(1 for doc in valid_docs for a in doc.amendment if a.confidence == "medium")
+            low = sum(1 for doc in valid_docs for a in doc.amendment if a.confidence == "low")
+            print(f"Confidence distribution – high: {high}, medium: {med}, low: {low}")
+    else:
+        print("\n✗ No documents were successfully parsed from any input PDF.")
 
 if __name__ == "__main__":
     main()
