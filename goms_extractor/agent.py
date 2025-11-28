@@ -1,7 +1,8 @@
 from google.adk.agents import LlmAgent
 from google.adk.agents import SequentialAgent
-from goms_extractor.tools import parse_amendments
+from goms_extractor.tools import parse_amendments, parse_amendments_from_markdown
 from goms_extractor.splitter import split_goms
+from goms_extractor.md_converter import convert_split_gos_to_markdown
 import logging
 
 # Set up logging to see detailed output
@@ -35,27 +36,53 @@ Return a detailed report of the splitting operation including number of files cr
     output_key="split_result"
 )
 
-# Amendment Parsing Agent
-amendment_parser_agent = LlmAgent(
-    name="amendment_parser_agent",
+# Markdown Converter Agent
+markdown_converter_agent = LlmAgent(
+    name="markdown_converter_agent",
     model=GEMINI_MODEL,
-    tools=[parse_amendments],  # Register the tool
+    tools=[convert_split_gos_to_markdown],  # Register the tool
     instruction="""
-You are an Amendment Parsing Specialist.
-Your task is to parse amendments from Government Order (GO) PDF files.
+You are a Markdown Conversion Specialist.
+Your task is to convert split GO PDF files into markdown format for easier processing.
+
 Input:
 {split_result}
 
 Rules:
-1. Extract the paths of the individual GO PDFs from the split result
-2. Call the parse_amendments function for each individual GO file
+1. Extract the split_result from the previous agent
+2. Call the convert_split_gos_to_markdown function with the split_result
+3. Ensure all PDF files are successfully converted to markdown
+4. Return the list of markdown file paths
+
+Output:
+Return a detailed report of the conversion operation including the number of markdown files created and their paths.
+""",
+    description="Converts split GO PDFs to markdown files",
+    output_key="markdown_result"
+)
+
+# Amendment Parsing Agent
+amendment_parser_agent = LlmAgent(
+    name="amendment_parser_agent",
+    model=GEMINI_MODEL,
+    tools=[parse_amendments_from_markdown],  # Register the tool
+    instruction="""
+You are an Amendment Parsing Specialist.
+Your task is to parse amendments from Government Order (GO) markdown files.
+
+Input:
+{markdown_result}
+
+Rules:
+1. Extract the list of markdown file paths from the markdown_result
+2. Call the parse_amendments_from_markdown function with the markdown file paths
 3. Process amendments with high accuracy
 4. Return comprehensive amendment data
 
 Output:
 Return a structured report with all parsed amendments including rule numbers, types of actions, target texts, and updated texts.
 """,
-    description="Parses amendments from GO PDF files",
+    description="Parses amendments from GO markdown files",
     output_key="parsed_amendments"
 )
 
@@ -66,6 +93,7 @@ report_generator_agent = LlmAgent(
     instruction="""
 You are a GO Analysis Report Generator.
 Your task is to create a comprehensive report from the parsed amendments.
+
 Input:
 {parsed_amendments}
 
@@ -84,8 +112,13 @@ Generate a well-structured report that summarizes the GO amendments, categorizes
 
 workflow_agent = SequentialAgent(
     name="goms_extraction_workflow_agent",
-    sub_agents=[go_splitter_agent, amendment_parser_agent, report_generator_agent],
-    description="Executes the workflow in strict sequence."
+    sub_agents=[
+        go_splitter_agent, 
+        markdown_converter_agent, 
+        amendment_parser_agent, 
+        report_generator_agent
+    ],
+    description="Executes the workflow in strict sequence: Split PDFs → Convert to Markdown → Parse Amendments → Generate Report"
 )
 
 root_agent = workflow_agent

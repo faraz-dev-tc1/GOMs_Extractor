@@ -114,11 +114,12 @@ Extract detailed information from the following amendment text. Pay special atte
 3. Clause (e.g., "clause (a)", "clause (b)")
 4. Sub-clause (e.g., "sub-clause (i)", "sub-clause (ii)")
 5. Proviso number if applicable (e.g., "first proviso", "second proviso")
-6. Any additional position context (e.g., "after the words", "in the beginning")
+6. Any additional position context (e.g., "the entire phrase specifying the position")
 7. Type of action: "sub" (substitution), "omit" (deletion), "add" (insertion)
 8. For SUBSTITUTIONS: Extract BOTH the target text (being replaced) AND the updated text
 9. For INSERTIONS: Extract the updated text being added
 10. For DELETIONS: Extract the target text being removed
+11. As a fallback take the entire text written under Amendment section
 
 AMENDMENT TEXT:
 {amendment_text}
@@ -140,11 +141,12 @@ Respond with ONLY a valid JSON object (no markdown, no explanations):
   "clause": "clause (Z)" or null,
   "sub_clause": "sub-clause (W)" or null,
   "proviso_no": "proviso number" or null,
-  "additional_position_ctx": "any additional position context" or null,
+  "additional_position_ctx": "the entire phrase specifying the position" or null,
   "type_of_action": "sub|omit|add",
   "target_text": "exact text being replaced/deleted (null if add)",
   "updated_text": "exact text being added/substituted (null if omit)",
   "confidence": "high|medium|low"
+  "raw_amendment_text": "the entire text written under Amendment section"
 }}
 
 RESPOND WITH ONLY THE JSON OBJECT:"""
