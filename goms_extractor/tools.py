@@ -77,6 +77,11 @@ def parse_amendments(input_pdf_path: str) -> Dict[str, Any]:
             "output_files": [json_output_path, md_output_path]
         }
         print(f"DEBUG: Parse amendments completed successfully")
+        
+        # Print token usage summary
+        from .token_tracker import TokenTracker
+        TokenTracker().print_summary()
+        
         return result
     except Exception as e:
         print(f"ERROR: Error parsing amendments: {str(e)}")
@@ -165,6 +170,11 @@ def parse_amendments_from_markdown(markdown_files: list) -> Dict[str, Any]:
             "output_files": [json_output_path, md_output_path]
         }
         print(f"DEBUG: Parse amendments from markdown completed successfully")
+        
+        # Print token usage summary
+        from .token_tracker import TokenTracker
+        TokenTracker().print_summary()
+        
         return result
     except Exception as e:
         print(f"ERROR: Error parsing amendments from markdown: {str(e)}")

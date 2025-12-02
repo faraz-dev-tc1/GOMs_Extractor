@@ -7,13 +7,15 @@ import os
 import re
 from typing import Dict, Any, List
 from dotenv import load_dotenv
-import vertexai
-from vertexai.generative_models import GenerativeModel, GenerationConfig, Part
+import os
+import re
+from typing import Dict, Any, List
+from dotenv import load_dotenv
 
 
 def convert_go_to_markdown(pdf_path: str, output_dir: str = None) -> Dict[str, Any]:
     """
-    Convert a single GO PDF file to markdown format.
+    Convert a single GO PDF file to markdown format using local OCR and text extraction.
     
     Args:
         pdf_path: Path to the GO PDF file
@@ -28,7 +30,7 @@ def convert_go_to_markdown(pdf_path: str, output_dir: str = None) -> Dict[str, A
             "goms_no": "GO number extracted from the document"
         }
     """
-    print(f"DEBUG: Converting PDF to markdown: {pdf_path}")
+    print(f"DEBUG: Converting PDF to markdown (local): {pdf_path}")
     try:
         # Set default output directory
         if output_dir is None:
@@ -39,64 +41,79 @@ def convert_go_to_markdown(pdf_path: str, output_dir: str = None) -> Dict[str, A
         os.makedirs(output_dir, exist_ok=True)
         print(f"DEBUG: Output directory created/verified: {output_dir}")
         
-        # Load environment variables
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(script_dir)
-        env_path = os.path.join(project_root, ".env")
-        load_dotenv(env_path)
+        # Ensure OCRmyPDF is available
+        import subprocess
+        import shutil
         
-        # Initialize Gemini
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-        if not project_id:
-            return {
+        if not shutil.which("ocrmypdf"):
+             print("WARNING: ocrmypdf not found. Skipping OCR step and relying on existing text.")
+        else:
+            # Run OCRmyPDF to ensure text is available (skip if already has text)
+            # We'll output to a temp file
+            temp_pdf_path = os.path.join(output_dir, f"temp_{os.path.basename(pdf_path)}")
+            print(f"DEBUG: Running OCRmyPDF on {pdf_path}...")
+            try:
+                # --skip-text: skip OCR if text is already present
+                # --tesseract-timeout 300: wait up to 5 mins
+                subprocess.run(
+                    ["ocrmypdf", "--skip-text", "--jobs", "4", pdf_path, temp_pdf_path],
+                    check=True,
+                    capture_output=True
+                )
+                # Use the OCR'd PDF
+                pdf_path = temp_pdf_path
+                print(f"DEBUG: OCR completed.")
+            except subprocess.CalledProcessError as e:
+                print(f"WARNING: OCRmyPDF failed: {e.stderr.decode()}. Using original PDF.")
+                if os.path.exists(temp_pdf_path):
+                    os.remove(temp_pdf_path)
+            except Exception as e:
+                print(f"WARNING: OCRmyPDF failed: {e}. Using original PDF.")
+
+        # Extract text using pdfplumber
+        import pdfplumber
+        print(f"DEBUG: Extracting text with pdfplumber...")
+        
+        full_text = ""
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    full_text += text + "\n\n"
+        
+        # Clean up temp file if it exists
+        if 'temp_pdf_path' in locals() and os.path.exists(temp_pdf_path):
+            os.remove(temp_pdf_path)
+            
+        if not full_text.strip():
+             return {
                 "status": "error",
-                "message": "GOOGLE_CLOUD_PROJECT environment variable not set",
+                "message": "No text extracted from PDF",
                 "markdown_path": None,
                 "goms_no": None
             }
-        
-        print(f"DEBUG: Initializing Vertex AI with project: {project_id}")
-        vertexai.init(project=project_id, location="asia-south1")
-        model = GenerativeModel("gemini-2.5-flash")
-        print(f"DEBUG: Gemini model initialized")
-        
-        # Read PDF as bytes
-        with open(pdf_path, "rb") as f:
-            pdf_data = f.read()
-        
-        # Create PDF part
-        pdf_part = Part.from_data(pdf_data, mime_type="application/pdf")
-        
-        # Prompt for markdown conversion
-        prompt = """Convert this Government Order (GO) PDF document to well-structured markdown format.
 
-INSTRUCTIONS:
-1. Extract ALL text content from the PDF
-2. Preserve the document structure and hierarchy
-3. Use proper markdown formatting:
-   - Use # for main headings (e.g., GOVERNMENT OF ANDHRA PRADESH)
-   - Use ## for section headings (e.g., ABSTRACT, NOTIFICATION, AMENDMENTS)
-   - Use ### for sub-sections
-   - Use **bold** for important labels like "G.O.Ms.No.", "Dated:", etc.
-   - Use bullet points or numbered lists where appropriate
-   - Use blockquotes (>) for quoted text or references
-4. Maintain the original text exactly as it appears
-5. Include all sections: header, abstract, references, notification, amendments, signature
-
-OUTPUT FORMAT:
-Return ONLY the markdown content, no explanations or additional text."""
-
-        print(f"DEBUG: Sending conversion request to Gemini...")
-        response = model.generate_content(
-            [prompt, pdf_part],
-            generation_config=GenerationConfig(
-                temperature=0.1,
-                max_output_tokens=8192
-            )
-        )
+        # Simple Markdown conversion heuristic
+        markdown_content = ""
+        lines = full_text.split('\n')
         
-        markdown_content = response.text.strip()
-        print(f"DEBUG: Markdown content generated ({len(markdown_content)} characters)")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Heuristic for headers
+            if line.isupper() and len(line) < 100:
+                if "GOVERNMENT" in line or "ORDER" in line or "NOTIFICATION" in line or "ABSTRACT" in line:
+                    markdown_content += f"## {line}\n\n"
+                else:
+                    markdown_content += f"### {line}\n\n"
+            elif line.startswith("G.O.Ms.No"):
+                markdown_content += f"**{line}**\n\n"
+            else:
+                markdown_content += f"{line}\n\n"
+        
+        print(f"DEBUG: Text extracted ({len(markdown_content)} characters)")
         
         # Extract GO number from markdown for filename
         goms_no = "Unknown"
@@ -189,6 +206,10 @@ def convert_split_gos_to_markdown(split_result: Dict[str, Any]) -> Dict[str, Any
     
     successful_conversions = len(markdown_files)
     total_files = len(split_files)
+    
+    # Print token usage summary
+    from .token_tracker import TokenTracker
+    TokenTracker().print_summary()
     
     if successful_conversions == 0:
         return {

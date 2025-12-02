@@ -46,7 +46,7 @@ Your task is to convert split GO PDF files into markdown format for easier proce
 Input:
 {split_result}
 
-Rules:
+Rules: 
 1. Extract the split_result from the previous agent
 2. Call the convert_split_gos_to_markdown function with the split_result
 3. Ensure all PDF files are successfully converted to markdown

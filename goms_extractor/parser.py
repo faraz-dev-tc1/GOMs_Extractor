@@ -156,6 +156,10 @@ RESPOND WITH ONLY THE JSON OBJECT:"""
                 prompt,
                 generation_config=self.generation_config,
             )
+            
+            # Track token usage
+            from .token_tracker import TokenTracker
+            TokenTracker().track_request("amendment_extraction", response)
 
             response_text = response.text.strip()
 
@@ -207,6 +211,10 @@ RESPOND WITH ONLY A JSON OBJECT:
                 prompt,
                 generation_config=self.generation_config,
             )
+            
+            # Track token usage
+            from .token_tracker import TokenTracker
+            TokenTracker().track_request("metadata_extraction", response)
 
             response_text = response.text.strip()
             response_text = response_text.replace("```json", "").replace("```", "").strip()
@@ -244,29 +252,56 @@ class EnhancedGoAmendmentParser:
                 self.gemini = None
 
     def extract_text_from_pdf(self, pdf_path: str) -> str:
-        """Extract text from PDF file using Gemini's multimodal API (no fallback)."""
-        if not self.gemini or not self.gemini.enabled:
-            raise RuntimeError("Gemini extractor is not enabled; cannot extract PDF text.")
+        """Extract text from PDF file using local OCR and pdfplumber (no Gemini)."""
+        import shutil
+        import subprocess
+        import pdfplumber
+        
+        print("  Extracting text locally...", end="", flush=True)
+        
+        # Check if we need OCR (if text extraction yields nothing)
+        # But first, let's try to extract text directly
+        full_text = ""
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        full_text += text + "\n\n"
+        except Exception as e:
+            print(f" (pdfplumber error: {e})", end="")
 
-        # Use Gemini for PDF extraction (handles scanned PDFs)
-        from vertexai.generative_models import Part
-
-        print("  Extracting text with Gemini...", end="", flush=True)
-
-        # Read PDF as bytes
-        with open(pdf_path, "rb") as f:
-            pdf_data = f.read()
-
-        # Create PDF part
-        pdf_part = Part.from_data(pdf_data, mime_type="application/pdf")
-
-        prompt = """Extract ALL text from this PDF document.
-Return the complete text content exactly as it appears, preserving formatting and structure.
-Do not summarize or skip any content."""
-
-        response = self.gemini.model.generate_content([prompt, pdf_part])
-        print(" ✓")
-        return response.text
+        # If text is sparse, try OCR
+        if len(full_text.strip()) < 100:
+            if shutil.which("ocrmypdf"):
+                print(" (running OCR)...", end="", flush=True)
+                temp_pdf_path = f"{pdf_path}_ocr_temp.pdf"
+                try:
+                    subprocess.run(
+                        ["ocrmypdf", "--skip-text", "--jobs", "4", pdf_path, temp_pdf_path],
+                        check=True,
+                        capture_output=True
+                    )
+                    # Extract from OCR'd PDF
+                    full_text = ""
+                    with pdfplumber.open(temp_pdf_path) as pdf:
+                        for page in pdf.pages:
+                            text = page.extract_text()
+                            if text:
+                                full_text += text + "\n\n"
+                    
+                    if os.path.exists(temp_pdf_path):
+                        os.remove(temp_pdf_path)
+                        
+                except Exception as e:
+                    print(f" (OCR failed: {e})", end="")
+                    if os.path.exists(temp_pdf_path):
+                        os.remove(temp_pdf_path)
+            else:
+                print(" (OCR tool not found)", end="")
+        
+        print(f" ✓ ({len(full_text)} chars)")
+        return full_text
 
     def split_into_gos(self, text: str) -> List[str]:
         """Split a large document into individual GOs"""

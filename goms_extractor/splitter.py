@@ -12,69 +12,38 @@ from typing import List, Dict, Any, Optional
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
 from dotenv import load_dotenv
-import vertexai
-from vertexai.generative_models import GenerativeModel, GenerationConfig
+from dotenv import load_dotenv
 
 
-def analyze_page_batch(pages_data: list, model: GenerativeModel) -> list:
+def analyze_page_regex(text: str) -> Dict[str, Any]:
     """
-    Analyzes a batch of pages using Gemini to identify GO Start/End.
-
-    Args:
-        pages_data: List of tuples (page_num, text)
-        model: Initialized Gemini model
-
-    Returns:
-        List of dicts with classification results
+    Analyzes a page using regex to identify GO Start/End.
     """
-    print(f"DEBUG: Analyzing batch of {len(pages_data)} pages with Gemini...")
-
-    prompt_text = ""
-    for page_num, text in pages_data:
-        # Limit text per page to avoid context limits, header/footer usually enough
-        clean_text = text[:1500].replace("\n", " ") if text else "NO TEXT"
-        prompt_text += f"--- PAGE {page_num + 1} ---\n{clean_text}\n\n"
-
-    prompt = f"""Analyze the following pages from a Government Order (GO) document bundle.
-For EACH page, determine:
-1. Is it the START of a new GO? (Look for "G.O.Ms.No", "GOVERNMENT OF...", "ABSTRACT")
-2. Is it the END of a GO? (Look for "BY ORDER AND IN THE NAME OF THE GOVERNOR", "SECTION OFFICER", "SECRETARY TO GOVERNMENT")
-3. If it's a START, extract the GOMs Number.
-
-PAGES:
-{prompt_text}
-
-Respond with a JSON LIST of objects, one for each page:
-[
-  {{
-    "page": <page_number>,
-    "is_start": true/false,
-    "is_end": true/false,
-    "goms_no": "number or null"
-  }},
-  ...
-]
-"""
-
-    try:
-        print(f"DEBUG: Sending batch analysis request to Gemini...")
-        response = model.generate_content(
-            prompt,
-            generation_config=GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.1
-            )
-        )
-        print(f"DEBUG: Gemini response received, parsing JSON...")
-        result = json.loads(response.text)
-        print(f"DEBUG: Batch analysis completed successfully, found {len([r for r in result if r['is_start'] or r['is_end']])} GO boundaries in batch")
-        return result
-    except Exception as e:
-        print(f"⚠️ Batch analysis failed: {e}")
-        # Return empty results for this batch to avoid crashing
-        result = [{"page": p[0] + 1, "is_start": False, "is_end": False, "goms_no": None} for p in pages_data]
-        print(f"DEBUG: Returned empty results for batch due to error")
-        return result
+    is_start = False
+    is_end = False
+    goms_no = None
+    
+    # Start detection
+    # Look for "GOVERNMENT OF..." and "ABSTRACT" near the top
+    if ("GOVERNMENT OF" in text[:500] and "ABSTRACT" in text[:1000]) or \
+       re.search(r'G\.O\.Ms\.No', text[:500], re.IGNORECASE):
+        is_start = True
+        
+        # Extract GOMs No
+        match = re.search(r'G\.O\.Ms\.No\.?\s*(\d+)', text, re.IGNORECASE)
+        if match:
+            goms_no = match.group(1)
+            
+    # End detection
+    # Look for signature block indicators near the bottom
+    if re.search(r'(SECTION OFFICER|FORWARDED|BY ORDER AND IN THE NAME)', text[-1000:], re.IGNORECASE):
+        is_end = True
+        
+    return {
+        "is_start": is_start,
+        "is_end": is_end,
+        "goms_no": goms_no
+    }
 
 
 def split_goms(input_pdf_path: str, output_dir: str = None) -> Dict[str, Any]:
@@ -105,54 +74,55 @@ def split_goms(input_pdf_path: str, output_dir: str = None) -> Dict[str, Any]:
         os.makedirs(output_dir, exist_ok=True)
         print(f"DEBUG: Output directory created/verified: {output_dir}")
 
-        # Load environment variables
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(script_dir)
-        env_path = os.path.join(project_root, ".env")
-        load_dotenv(env_path)
-
-        # Initialize Gemini
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-        if not project_id:
-            print(f"ERROR: GOOGLE_CLOUD_PROJECT environment variable not set")
-            return {
-                "status": "error",
-                "message": "GOOGLE_CLOUD_PROJECT environment variable not set",
-                "split_files": [],
-                "go_index": []
-            }
-
-        print(f"DEBUG: Initializing Vertex AI with project: {project_id}")
-        vertexai.init(project=project_id, location="asia-south1")
-        model = GenerativeModel("gemini-2.5-flash")
-        print(f"DEBUG: Gemini model initialized")
+        # Pre-process with OCRmyPDF
+        import shutil
+        import subprocess
+        
+        if shutil.which("ocrmypdf"):
+            print(f"DEBUG: Running OCRmyPDF on input file: {input_pdf_path}...")
+            temp_ocr_filename = f"ocr_{os.path.basename(input_pdf_path)}"
+            temp_ocr_path = os.path.join(output_dir, temp_ocr_filename)
+            
+            try:
+                # --skip-text: skip OCR if text is already present
+                # --jobs 4: use 4 cores
+                # --output-type pdf: ensure output is PDF
+                subprocess.run(
+                    ["ocrmypdf", "--skip-text", "--jobs", "4", input_pdf_path, temp_ocr_path],
+                    check=True,
+                    capture_output=True
+                )
+                print(f"DEBUG: OCR completed. Using OCR'd file: {temp_ocr_path}")
+                input_pdf_path = temp_ocr_path # Switch to using the OCR'd file
+            except subprocess.CalledProcessError as e:
+                print(f"WARNING: OCRmyPDF failed: {e.stderr.decode()}. Using original PDF.")
+            except Exception as e:
+                print(f"WARNING: OCRmyPDF failed: {e}. Using original PDF.")
+        else:
+             print("WARNING: ocrmypdf not found. Skipping OCR pre-processing.")
 
         # Load PDF
         reader = PdfReader(input_pdf_path)
         num_pages = len(reader.pages)
         print(f"DEBUG: Loaded PDF with {num_pages} pages")
 
-        # Extract text for all pages first (faster than doing it in loop)
+        # Extract text for all pages
         all_pages_text = []
         print(f"DEBUG: Extracting text from all pages...")
         with pdfplumber.open(input_pdf_path) as pdf:
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text() or ""
                 all_pages_text.append((i, text))
-                print(f"  Page {i+1}: {len(text)} characters")
+                # print(f"  Page {i+1}: {len(text)} characters")
 
-        # Process in batches
-        BATCH_SIZE = 10
+        # Analyze pages using regex
         results = []
-        print(f"DEBUG: Processing {num_pages} pages in batches of {BATCH_SIZE}...")
+        print(f"DEBUG: Analyzing {num_pages} pages using regex...")
 
-        for i in range(0, num_pages, BATCH_SIZE):
-            batch = all_pages_text[i : i + BATCH_SIZE]
-            print(f"  Processing batch {i//BATCH_SIZE + 1}: pages {batch[0][0]+1}-{batch[-1][0]+1}")
-            batch_results = analyze_page_batch(batch, model)
-            results.extend(batch_results)
-            print(f"  Batch results: {len([r for r in batch_results if r['is_start'] or r['is_end']])} GO boundaries detected")
-            time.sleep(10) # Rate limiting for quota
+        for i, text in all_pages_text:
+            analysis = analyze_page_regex(text)
+            analysis["page"] = i
+            results.append(analysis)
 
         print(f"DEBUG: Analyzed all pages, found {len([r for r in results if r['is_start'] or r['is_end']])} potential GO boundaries")
 
@@ -171,21 +141,32 @@ def split_goms(input_pdf_path: str, output_dir: str = None) -> Dict[str, Any]:
             if is_start:
                 # If previous GO was open, close it at previous page
                 if current_go:
-                    current_go["end_page"] = page_num - 2 # 0-indexed, previous page
+                    current_go["end_page"] = page_num - 1 # Close at previous page
                     print(f"  Completed previous GO: {current_go['goms_no']} (pages {current_go['start_page']+1} to {current_go['end_page']+1})")
                     go_index.append(current_go)
 
                 current_go = {
                     "goms_no": goms_no or "Unknown",
-                    "start_page": page_num - 1, # 0-indexed
+                    "start_page": page_num, # 0-indexed
                     "end_page": None # Will be set later
                 }
                 print(f"  Started new GO: {current_go['goms_no']} at page {current_go['start_page']+1}")
 
             # End of GO
             if is_end and current_go:
-                current_go["end_page"] = page_num - 1 # 0-indexed
-                print(f"  Ended GO: {current_go['goms_no']} at page {current_go['end_page']+1} (pages {current_go['start_page']+1} to {current_go['end_page']+1})")
+                # If we find an end marker, it's likely the end of the current GO
+                # But sometimes end marker is on the same page as start (single page GO)
+                # Or multiple end markers (e.g. one for notification, one for order)
+                # We'll assume the last end marker closes it, or the next start marker closes it.
+                # For now, let's just mark it. If we encounter a new start, we'll close it anyway.
+                # If we encounter an end, we can close it, but what if there are pages after?
+                # Usually "SECTION OFFICER" is the very end.
+                current_go["end_page"] = page_num
+                # We don't append yet, in case there are multiple end markers or we want to wait for next start?
+                # Actually, if we close it here, and there's no next start immediately, we might miss pages?
+                # But "SECTION OFFICER" is usually the end.
+                # Let's close it.
+                print(f"  Ended GO: {current_go['goms_no']} at page {current_go['end_page']+1}")
                 go_index.append(current_go)
                 current_go = None
 
@@ -229,6 +210,11 @@ def split_goms(input_pdf_path: str, output_dir: str = None) -> Dict[str, Any]:
             print(f"    Created: {output_path}")
 
         print(f"DEBUG: Splitting completed successfully")
+        
+        # Print token usage summary
+        from .token_tracker import TokenTracker
+        TokenTracker().print_summary()
+        
         result = {
             "status": "success",
             "message": f"Successfully split {input_pdf_path} into {len(split_files)} files. Output directory: {output_dir}",
