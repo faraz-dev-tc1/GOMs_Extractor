@@ -11,4 +11,5 @@ __pycache__/
 
 # Outputs
 outputs/
-outputs_001/
+
+.pytest_cache

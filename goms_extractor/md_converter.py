@@ -9,11 +9,11 @@ from typing import Dict, Any, List
 from dotenv import load_dotenv
 import os
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
 
-def convert_go_to_markdown(pdf_path: str, output_dir: str = None) -> Dict[str, Any]:
+def convert_go_to_markdown(pdf_path: str, output_dir: Optional[str] = None) -> Dict[str, Any]:
     """
     Convert a single GO PDF file to markdown format using local OCR and text extraction.
     
@@ -118,7 +118,7 @@ def convert_go_to_markdown(pdf_path: str, output_dir: str = None) -> Dict[str, A
         }
 
 
-def convert_split_gos_to_markdown(split_result: Dict[str, Any]) -> Dict[str, Any]:
+def convert_split_gos_to_markdown(split_result: Dict[str, Any], output_dir: Optional[str] = None) -> Dict[str, Any]:
     """
     Convert all split GO PDFs to markdown files.
     

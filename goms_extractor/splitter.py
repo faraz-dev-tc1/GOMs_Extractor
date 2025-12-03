@@ -46,7 +46,7 @@ def analyze_page_regex(text: str) -> Dict[str, Any]:
     }
 
 
-def split_goms(input_pdf_path: str, output_dir: str = None) -> Dict[str, Any]:
+def split_goms(input_pdf_path: str, output_dir: Optional[str] = None) -> Dict[str, Any]:
     """
     Split a PDF containing multiple Government Orders (GOs) into individual PDF files.
 
