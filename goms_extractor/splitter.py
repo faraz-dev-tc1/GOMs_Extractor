@@ -18,26 +18,26 @@ from dotenv import load_dotenv
 def analyze_page_regex(text: str) -> Dict[str, Any]:
     """
     Analyzes a page using regex to identify GO Start/End.
+    STRICT MODE: Splits only by Heading ("GOVERNMENT OF...")
     """
     is_start = False
     is_end = False
     goms_no = None
     
-    # Start detection
-    # Look for "GOVERNMENT OF..." and "ABSTRACT" near the top
-    if ("GOVERNMENT OF" in text[:500] and "ABSTRACT" in text[:1000]) or \
-       re.search(r'G\.O\.Ms\.No', text[:500], re.IGNORECASE):
+    # Start detection - STRICTLY BY HEADING
+    # Look for "GOVERNMENT OF" in the first 300 characters (Header)
+    # This is the primary signal for a new GO.
+    if "GOVERNMENT OF" in text[:300].upper():
         is_start = True
         
-        # Extract GOMs No
+        # Extract GOMs No for metadata if available
         match = re.search(r'G\.O\.Ms\.No\.?\s*(\d+)', text, re.IGNORECASE)
         if match:
             goms_no = match.group(1)
             
-    # End detection
-    # Look for signature block indicators near the bottom
-    if re.search(r'(SECTION OFFICER|FORWARDED|BY ORDER AND IN THE NAME)', text[-1000:], re.IGNORECASE):
-        is_end = True
+    # Disable explicit end detection to rely solely on the next header (start)
+    # This ensures we split "Start to Start"
+    is_end = False
         
     return {
         "is_start": is_start,
