@@ -7,7 +7,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 import os
 import shutil
 import uuid
@@ -38,9 +38,9 @@ app.add_middleware(
 
 # Configuration
 ADK_API_URL = os.getenv("ADK_API_URL", "http://localhost:8000")
-APP_NAME = "goms_extractor"
-UPLOAD_DIR = "/tmp/goms_gateway_uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+APP_NAME = "goms_extraction_workflow_agent"
+UPLOAD_DIR = "/srv/documents"
+os.makedirs(UPLOAD_DIR, exist_ok=True)  # Requires directory to be created with proper permissions
 
 # HTTP client for ADK API
 http_client = httpx.AsyncClient(timeout=600.0)  # 10 minute timeout for long-running tasks
@@ -71,12 +71,10 @@ class JobStatusResponse(BaseModel):
     session_id: str
     status: str
     message: Optional[str] = None
-    result: Optional[Dict[str, Any]] = None
+    result: Optional[Union[Dict[str, Any], List[Any]]] = None
     created_at: str
     updated_at: str
 
-
-# In-memory job tracking
 jobs: Dict[str, Dict[str, Any]] = {}
 
 
@@ -129,34 +127,50 @@ async def process_pdf_task(job_id: str, pdf_path: str, user_id: str, session_id:
         logger.info(f"Job {job_id}: Starting processing")
         jobs[job_id]["status"] = "processing"
         jobs[job_id]["updated_at"] = datetime.now().isoformat()
-        
+
         # Create session in ADK
         session_created = await create_adk_session(user_id, session_id)
         if not session_created:
             raise Exception("Failed to create ADK session")
-        
-        # Prepare message
-        message = f"Process this PDF file: {pdf_path}"
+
+        # Prepare message with file path
+        message = f"Process this document:\n{pdf_path}"
         if output_dir:
-            message += f" and save outputs to {output_dir}"
-        
+            message += f"\nSave outputs to: {output_dir}"
+
         # Send to agent
-        logger.info(f"Job {job_id}: Sending message to agent")
+        logger.info(f"Job {job_id}: Sending message to agent with file path: {pdf_path}")
         result = await send_message_to_agent(user_id, session_id, message)
-        
+
         # Update job status
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["result"] = result
         jobs[job_id]["message"] = "Processing completed successfully"
         jobs[job_id]["updated_at"] = datetime.now().isoformat()
-        
+
         logger.info(f"Job {job_id}: Completed successfully")
-        
+
+        # Clean up the uploaded file after successful processing
+        try:
+            if os.path.exists(pdf_path):
+                os.remove(pdf_path)
+                logger.info(f"Cleaned up file: {pdf_path}")
+        except Exception as cleanup_error:
+            logger.warning(f"Failed to clean up file {pdf_path}: {cleanup_error}")
+
     except Exception as e:
         logger.error(f"Job {job_id}: Failed - {str(e)}", exc_info=True)
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["message"] = f"Processing failed: {str(e)}"
         jobs[job_id]["updated_at"] = datetime.now().isoformat()
+
+        # Even in case of failure, try to clean up the file
+        try:
+            if os.path.exists(pdf_path):
+                os.remove(pdf_path)
+                logger.info(f"Cleaned up file after failure: {pdf_path}")
+        except Exception as cleanup_error:
+            logger.warning(f"Failed to clean up file after failure {pdf_path}: {cleanup_error}")
 
 
 @app.get("/")
@@ -215,18 +229,18 @@ async def process_pdf_upload(
     # Validate file type
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
-    
+
     # Generate IDs
     job_id, user_id, session_id = generate_ids()
-    
-    # Save uploaded file
+
+    # Save uploaded file to shared directory with unique name
     file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
-    
+
     # Create job entry
     jobs[job_id] = {
         "job_id": job_id,
@@ -240,12 +254,12 @@ async def process_pdf_upload(
         "file_path": file_path,
         "original_filename": file.filename
     }
-    
+
     # Add background task
     background_tasks.add_task(process_pdf_task, job_id, file_path, user_id, session_id)
-    
+
     logger.info(f"Created job {job_id} for file {file.filename}")
-    
+
     return JobResponse(**jobs[job_id])
 
 
@@ -330,6 +344,7 @@ async def delete_job(job_id: str):
         try:
             if os.path.exists(job["file_path"]):
                 os.remove(job["file_path"])
+                logger.info(f"Deleted file during job cleanup: {job['file_path']}")
         except Exception as e:
             logger.warning(f"Failed to delete file {job['file_path']}: {e}")
     

@@ -75,7 +75,7 @@ class TestRootEndpoint:
         
         assert data["name"] == "GOMS Extraction Gateway API"
         assert data["version"] == "1.0.0"
-        assert data["app_name"] == "goms_extractor"
+        assert data["app_name"] == "goms_extraction_workflow_agent"
         assert "endpoints" in data
 
 
@@ -363,7 +363,7 @@ class TestADKPassthrough:
         # Mock successful response
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_response.json.return_value = ["goms_extractor", "other_agent"]
+        mock_response.json.return_value = ["goms_extraction_workflow_agent", "other_agent"]
         mock_http_client.get = AsyncMock(return_value=mock_response)
         
         response = client.get("/adk/list-apps")
@@ -371,7 +371,7 @@ class TestADKPassthrough:
         assert response.status_code == 200
         data = response.json()
         
-        assert "goms_extractor" in data
+        assert "goms_extraction_workflow_agent" in data
         assert "other_agent" in data
     
     def test_list_adk_apps_failure(self, client, mock_http_client):
