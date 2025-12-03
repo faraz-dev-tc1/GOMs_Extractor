@@ -41,36 +41,7 @@ def convert_go_to_markdown(pdf_path: str, output_dir: str = None) -> Dict[str, A
         os.makedirs(output_dir, exist_ok=True)
         print(f"DEBUG: Output directory created/verified: {output_dir}")
         
-        # Ensure OCRmyPDF is available
-        import subprocess
-        import shutil
-        
-        if not shutil.which("ocrmypdf"):
-             print("WARNING: ocrmypdf not found. Skipping OCR step and relying on existing text.")
-        else:
-            # Run OCRmyPDF to ensure text is available (skip if already has text)
-            # We'll output to a temp file
-            temp_pdf_path = os.path.join(output_dir, f"temp_{os.path.basename(pdf_path)}")
-            print(f"DEBUG: Running OCRmyPDF on {pdf_path}...")
-            try:
-                # --skip-text: skip OCR if text is already present
-                # --tesseract-timeout 300: wait up to 5 mins
-                subprocess.run(
-                    ["ocrmypdf", "--skip-text", "--jobs", "4", pdf_path, temp_pdf_path],
-                    check=True,
-                    capture_output=True
-                )
-                # Use the OCR'd PDF
-                pdf_path = temp_pdf_path
-                print(f"DEBUG: OCR completed.")
-            except subprocess.CalledProcessError as e:
-                print(f"WARNING: OCRmyPDF failed: {e.stderr.decode()}. Using original PDF.")
-                if os.path.exists(temp_pdf_path):
-                    os.remove(temp_pdf_path)
-            except Exception as e:
-                print(f"WARNING: OCRmyPDF failed: {e}. Using original PDF.")
-
-        # Extract text using pdfplumber
+        # Extract text using pdfplumber (no OCR needed - files are already OCR'd by splitter)
         import pdfplumber
         print(f"DEBUG: Extracting text with pdfplumber...")
         
@@ -81,10 +52,6 @@ def convert_go_to_markdown(pdf_path: str, output_dir: str = None) -> Dict[str, A
                 if text:
                     full_text += text + "\n\n"
         
-        # Clean up temp file if it exists
-        if 'temp_pdf_path' in locals() and os.path.exists(temp_pdf_path):
-            os.remove(temp_pdf_path)
-            
         if not full_text.strip():
              return {
                 "status": "error",

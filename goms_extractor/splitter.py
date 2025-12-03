@@ -74,21 +74,27 @@ def split_goms(input_pdf_path: str, output_dir: str = None) -> Dict[str, Any]:
         os.makedirs(output_dir, exist_ok=True)
         print(f"DEBUG: Output directory created/verified: {output_dir}")
 
-        # Pre-process with OCRmyPDF
         import shutil
         import subprocess
         
-        if shutil.which("ocrmypdf"):
+        if not shutil.which("ocrmypdf"):
+            raise RuntimeError(
+                "OCRmyPDF is required but not found. Please install it:\n"
+                "  Ubuntu/Debian: sudo apt-get install ocrmypdf\n"
+                "  macOS: brew install ocrmypdf\n"
+                "  pip: pip install ocrmypdf"
+            )
+        
             print(f"DEBUG: Running OCRmyPDF on input file: {input_pdf_path}...")
             temp_ocr_filename = f"ocr_{os.path.basename(input_pdf_path)}"
             temp_ocr_path = os.path.join(output_dir, temp_ocr_filename)
             
             try:
-                # --skip-text: skip OCR if text is already present
+                # --force-ocr: always perform OCR even if text is present
                 # --jobs 4: use 4 cores
                 # --output-type pdf: ensure output is PDF
                 subprocess.run(
-                    ["ocrmypdf", "--skip-text", "--jobs", "4", input_pdf_path, temp_ocr_path],
+                    ["ocrmypdf", "--force-ocr", "--jobs", "4", input_pdf_path, temp_ocr_path],
                     check=True,
                     capture_output=True
                 )
@@ -97,9 +103,7 @@ def split_goms(input_pdf_path: str, output_dir: str = None) -> Dict[str, Any]:
             except subprocess.CalledProcessError as e:
                 print(f"WARNING: OCRmyPDF failed: {e.stderr.decode()}. Using original PDF.")
             except Exception as e:
-                print(f"WARNING: OCRmyPDF failed: {e}. Using original PDF.")
-        else:
-             print("WARNING: ocrmypdf not found. Skipping OCR pre-processing.")
+                raise RuntimeError(f"OCRmyPDF processing failed: {str(e)}")
 
         # Load PDF
         reader = PdfReader(input_pdf_path)
