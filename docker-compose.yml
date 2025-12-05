@@ -1,0 +1,52 @@
+services:
+  goms-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: goms-extraction-api
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      # Google Cloud Configuration
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
+      - GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION:-us-central1}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
+
+      # GCS Configuration (optional - will use local storage if not set)
+      - GCS_BUCKET=${GCS_BUCKET:-}
+
+      # ADK API Configuration (if using agent-based processing)
+      - ADK_API_URL=${ADK_API_URL:-http://localhost:8000}
+
+      # API Configuration
+      - API_HOST=0.0.0.0
+      - API_PORT=8080
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_WORKERS=${MAX_WORKERS:-4}
+      - UPLOAD_DIR=/tmp/documents
+
+    volumes:
+      # Mount outputs directory for local storage
+      - ./outputs:/app/outputs
+
+      # Mount credentials (if using service account)
+      # Uncomment and set the path to your service account JSON file
+      # - /path/to/your/service-account.json:/app/credentials/service-account.json:ro
+
+      # Mount data directory (optional, for testing with local PDFs)
+      - ./data:/app/data:ro
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  default:
+    name: goms-network

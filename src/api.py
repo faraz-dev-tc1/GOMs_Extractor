@@ -250,7 +250,7 @@ async def process_pdf_task_direct(
             }
         }
 
-        # Step 3: Automatically upload to GCS if configured
+        # Step 3: Upload to GCS if configured, otherwise use local storage
         if GCS_ENABLED:
             logger.info(f"Job {job_id}: Uploading results to GCS bucket: {GCS_BUCKET}...")
             try:
@@ -311,37 +311,46 @@ async def process_pdf_task_direct(
                     "uploads": upload_results
                 }
                 
-                result["gcs_upload"] = gcs_result
+                result["storage"] = gcs_result
+                result["storage_type"] = "gcs"
                 logger.info(f"Job {job_id}: GCS upload completed - {gcs_result['message']}")
                 
             except Exception as gcs_error:
                 logger.error(f"Job {job_id}: GCS upload failed - {str(gcs_error)}")
-                result["gcs_upload"] = {
+                result["storage"] = {
                     "status": "error",
                     "message": f"GCS upload failed: {str(gcs_error)}"
                 }
+                result["storage_type"] = "gcs"
         else:
-            logger.critical(f"Job {job_id}: CRITICAL - GCS upload FAILED - GCS_BUCKET environment variable not configured. This is a required configuration for document storage.")
-            result["gcs_upload"] = {
-                "status": "error",
-                "message": "GCS_BUCKET environment variable not set - Document storage is required but not configured"
+            # Use local storage when GCS is not configured
+            logger.info(f"Job {job_id}: GCS_BUCKET not configured, using local storage")
+            
+            # Get the output directories from the results
+            split_dir = os.path.dirname(split_result.get("split_files", [""])[0]) if split_result.get("split_files") else "N/A"
+            markdown_dir = os.path.dirname(markdown_result.get("markdown_files", [""])[0]) if markdown_result.get("markdown_files") else "N/A"
+            
+            result["storage"] = {
+                "status": "success",
+                "storage_type": "local",
+                "split_pdfs_path": split_dir,
+                "markdown_path": markdown_dir,
+                "total_files": len(split_result.get("split_files", [])) + len(markdown_result.get("markdown_files", [])),
+                "message": f"Files stored locally (GCS not configured)"
             }
-            # Mark job as failed since GCS upload is mandatory
-            jobs[job_id]["status"] = "failed"
-            jobs[job_id]["result"] = result
-            jobs[job_id]["message"] = f"Processing failed: GCS storage is required but GCS_BUCKET is not configured"
-            jobs[job_id]["updated_at"] = datetime.now().isoformat()
-            logger.error(f"Job {job_id}: Failed due to missing GCS configuration")
-            return
+            result["storage_type"] = "local"
+            logger.info(f"Job {job_id}: Using local storage - split PDFs: {split_dir}, markdown: {markdown_dir}")
 
         # Update job status
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["result"] = result
         
-        # Update message to include GCS info if uploaded
+        # Update message to include storage info
         message = f"Processing completed: {result['summary']['successful_conversions']}/{result['summary']['total_gos_found']} GOs converted"
-        if GCS_ENABLED and result.get("gcs_upload", {}).get("status") == "success":
-            message += f" | Uploaded to GCS: gs://{GCS_BUCKET}/{result['gcs_upload']['gcs_prefix']}"
+        if result.get("storage_type") == "gcs" and result.get("storage", {}).get("status") == "success":
+            message += f" | Uploaded to GCS: gs://{GCS_BUCKET}/{result['storage']['gcs_prefix']}"
+        elif result.get("storage_type") == "local":
+            message += f" | Stored locally: {result['storage']['split_pdfs_path']}"
         
         jobs[job_id]["message"] = message
         jobs[job_id]["updated_at"] = datetime.now().isoformat()
@@ -527,13 +536,9 @@ async def process_pdf_upload_direct(
     This endpoint bypasses the ADK agent and directly calls the processing functions.
     Returns a job ID that can be used to check processing status.
     """
-    # Validate GCS configuration first
+    # Log storage configuration (GCS or local)
     if not GCS_ENABLED:
-        logger.critical("CRITICAL: GCS_BUCKET environment variable is not configured. Document storage is required.")
-        raise HTTPException(
-            status_code=503,
-            detail="GCS storage is not configured. Please set the GCS_BUCKET environment variable. Document storage is a required service."
-        )
+        logger.info("GCS_BUCKET not configured, will use local storage for this job")
     
     # Validate file type
     if not file.filename.endswith('.pdf'):
@@ -584,13 +589,9 @@ async def process_pdf_path_direct(
     Automatically uploads results to GCS if GCS_BUCKET environment variable is set.
     Returns a job ID that can be used to check processing status.
     """
-    # Validate GCS configuration first
+    # Log storage configuration (GCS or local)
     if not GCS_ENABLED:
-        logger.critical("CRITICAL: GCS_BUCKET environment variable is not configured. Document storage is required.")
-        raise HTTPException(
-            status_code=503,
-            detail="GCS storage is not configured. Please set the GCS_BUCKET environment variable. Document storage is a required service."
-        )
+        logger.info("GCS_BUCKET not configured, will use local storage for this job")
     
     # Validate file exists
     if not os.path.exists(request.pdf_path):
@@ -606,6 +607,8 @@ async def process_pdf_path_direct(
     message = f"Job created, direct processing will start shortly (concurrent with {max_workers} workers)"
     if GCS_ENABLED:
         message += f" | Will auto-upload to GCS: {GCS_BUCKET}"
+    else:
+        message += " | Will use local storage"
     
     jobs[job_id] = {
         "job_id": job_id,

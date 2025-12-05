@@ -1,21 +1,23 @@
 """
 Markdown converter for Government Orders (GOs).
-Converts split GO PDFs into markdown files for easier processing.
+Converts split GO PDFs into markdown files using Vertex AI Gemini 2.5-flash.
 """
 
 import os
 import re
-from typing import Dict, Any, List
-from dotenv import load_dotenv
-import os
-import re
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
+import vertexai
+from vertexai.generative_models import GenerativeModel, Part
+import base64
+
+# Load environment variables
+load_dotenv()
 
 
 def convert_go_to_markdown(pdf_path: str, output_dir: Optional[str] = None) -> Dict[str, Any]:
     """
-    Convert a single GO PDF file to markdown format using local OCR and text extraction.
+    Convert a single GO PDF file to markdown format using Vertex AI Gemini 2.5-flash.
     
     Args:
         pdf_path: Path to the GO PDF file
@@ -30,7 +32,7 @@ def convert_go_to_markdown(pdf_path: str, output_dir: Optional[str] = None) -> D
             "goms_no": "GO number extracted from the document"
         }
     """
-    print(f"DEBUG: Converting PDF to markdown (local): {pdf_path}")
+    print(f"DEBUG: Converting PDF to markdown using Gemini 2.5-flash: {pdf_path}")
     try:
         # Set default output directory
         if output_dir is None:
@@ -41,46 +43,75 @@ def convert_go_to_markdown(pdf_path: str, output_dir: Optional[str] = None) -> D
         os.makedirs(output_dir, exist_ok=True)
         print(f"DEBUG: Output directory created/verified: {output_dir}")
         
-        # Extract text using pdfplumber (no OCR needed - files are already OCR'd by splitter)
-        import pdfplumber
-        print(f"DEBUG: Extracting text with pdfplumber...")
+        # Initialize Vertex AI
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+        location = os.getenv("GOOGLE_CLOUD_REGION", "us-central1")
         
-        full_text = ""
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    full_text += text + "\n\n"
-        
-        if not full_text.strip():
-             return {
+        if not project_id:
+            return {
                 "status": "error",
-                "message": "No text extracted from PDF",
+                "message": "GOOGLE_CLOUD_PROJECT environment variable not set",
                 "markdown_path": None,
                 "goms_no": None
             }
+        
+        print(f"DEBUG: Initializing Vertex AI (project: {project_id}, location: {location})")
+        vertexai.init(project=project_id, location=location)
+        
+        # Initialize Gemini model
+        model = GenerativeModel("gemini-2.0-flash-exp")
+        print(f"DEBUG: Gemini model initialized")
+        
+        # Read PDF file as bytes
+        with open(pdf_path, 'rb') as f:
+            pdf_bytes = f.read()
+        
+        # Create PDF part for Gemini
+        pdf_part = Part.from_data(
+            data=pdf_bytes,
+            mime_type="application/pdf"
+        )
+        
+        # Create prompt for markdown conversion
+        prompt = """Convert this Government Order (GO) PDF document into well-formatted markdown.
 
-        # Simple Markdown conversion heuristic
-        markdown_content = ""
-        lines = full_text.split('\n')
+Instructions:
+1. Extract ALL text content from the document
+2. Preserve the document structure and hierarchy
+3. Use appropriate markdown formatting:
+   - Use ## for main headings (GOVERNMENT, ORDER, NOTIFICATION, ABSTRACT, etc.)
+   - Use ### for sub-headings
+   - Use **bold** for important elements like G.O.Ms.No
+   - Preserve tables, lists, and formatting
+4. Maintain the original text exactly as it appears
+5. Include all dates, numbers, and official references
+6. Do not add any commentary or explanations
+7. Return ONLY the markdown content, no additional text
+
+Output the complete markdown representation of this document."""
+
+        print(f"DEBUG: Sending PDF to Gemini for conversion...")
         
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-                
-            # Heuristic for headers
-            if line.isupper() and len(line) < 100:
-                if "GOVERNMENT" in line or "ORDER" in line or "NOTIFICATION" in line or "ABSTRACT" in line:
-                    markdown_content += f"## {line}\n\n"
-                else:
-                    markdown_content += f"### {line}\n\n"
-            elif line.startswith("G.O.Ms.No"):
-                markdown_content += f"**{line}**\n\n"
-            else:
-                markdown_content += f"{line}\n\n"
+        # Generate content using Gemini
+        response = model.generate_content(
+            [prompt, pdf_part],
+            generation_config={
+                "temperature": 0.0,
+                "max_output_tokens": 8192,
+            }
+        )
         
-        print(f"DEBUG: Text extracted ({len(markdown_content)} characters)")
+        # Extract markdown content from response
+        if not response.text:
+            return {
+                "status": "error",
+                "message": "No content extracted from PDF by Gemini",
+                "markdown_path": None,
+                "goms_no": None
+            }
+        
+        markdown_content = response.text.strip()
+        print(f"DEBUG: Markdown extracted ({len(markdown_content)} characters)")
         
         # Extract GO number from markdown for filename
         goms_no = "Unknown"
@@ -99,9 +130,17 @@ def convert_go_to_markdown(pdf_path: str, output_dir: Optional[str] = None) -> D
         
         print(f"DEBUG: Markdown file created: {output_path}")
         
+        # Track token usage if tracker is available
+        try:
+            from .token_tracker import TokenTracker
+            tracker = TokenTracker()
+            tracker.track_response(response, context="convert_go_to_markdown")
+        except Exception as e:
+            print(f"DEBUG: Token tracking not available: {e}")
+        
         return {
             "status": "success",
-            "message": f"Successfully converted {pdf_path} to markdown",
+            "message": f"Successfully converted {pdf_path} to markdown using Gemini 2.5-flash",
             "markdown_path": output_path,
             "goms_no": goms_no
         }
@@ -116,6 +155,7 @@ def convert_go_to_markdown(pdf_path: str, output_dir: Optional[str] = None) -> D
             "markdown_path": None,
             "goms_no": None
         }
+
 
 
 def convert_split_gos_to_markdown(split_result: Dict[str, Any], output_dir: Optional[str] = None, max_workers: int = 4) -> Dict[str, Any]:
