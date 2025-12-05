@@ -16,8 +16,12 @@ import logging
 import httpx
 import asyncio
 import functools
+import sys
+from pathlib import Path
 
-# Import the processing functions for direct in-process calls
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from goms_extractor.splitter import split_goms
 from goms_extractor.md_converter import convert_split_gos_to_markdown
 
@@ -47,6 +51,10 @@ APP_NAME = "goms_extraction_workflow_agent"
 UPLOAD_DIR = "/tmp/documents"
 os.makedirs(UPLOAD_DIR, exist_ok=True)  # Requires directory to be created with proper permissions
 
+# GCS Configuration
+GCS_BUCKET = os.getenv("GCS_BUCKET")  # Set via environment variable
+GCS_ENABLED = GCS_BUCKET is not None
+
 # HTTP client for ADK API
 http_client = httpx.AsyncClient(timeout=600.0)  # 10 minute timeout for long-running tasks
 
@@ -57,6 +65,7 @@ class ProcessRequest(BaseModel):
     output_dir: Optional[str] = None
     user_id: Optional[str] = None
     session_id: Optional[str] = None
+
 
 
 class JobResponse(BaseModel):
@@ -178,10 +187,16 @@ async def process_pdf_task(job_id: str, pdf_path: str, user_id: str, session_id:
             logger.warning(f"Failed to clean up file after failure {pdf_path}: {cleanup_error}")
 
 
-async def process_pdf_task_direct(job_id: str, pdf_path: str, output_dir: Optional[str] = None, max_workers: int = 4):
+async def process_pdf_task_direct(
+    job_id: str, 
+    pdf_path: str, 
+    output_dir: Optional[str] = None, 
+    max_workers: int = 4
+):
     """
     Background task to process PDF using direct in-process calls (concurrent).
     This bypasses the ADK agent and directly calls split_goms and convert_split_gos_to_markdown.
+    Automatically uploads results to GCS if GCS_BUCKET is configured.
     """
     try:
         logger.info(f"Job {job_id}: Starting direct processing (concurrent with {max_workers} workers)")
@@ -228,10 +243,93 @@ async def process_pdf_task_direct(job_id: str, pdf_path: str, output_dir: Option
             }
         }
 
+        # Step 3: Automatically upload to GCS if configured
+        if GCS_ENABLED:
+            logger.info(f"Job {job_id}: Uploading results to GCS bucket: {GCS_BUCKET}...")
+            try:
+                from src.gcs_storage import GCSUploader
+                
+                uploader = GCSUploader(bucket_name=GCS_BUCKET)
+                
+                # Generate timestamp-based prefix for organization
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                gcs_prefix = f"goms_outputs/{timestamp}_{job_id[:8]}"
+                
+                # Upload split PDFs and markdown files to separate folders
+                upload_results = []
+                successful_uploads = 0
+                failed_uploads = 0
+                
+                # Upload split PDFs
+                logger.info(f"Job {job_id}: Uploading {len(split_result.get('split_files', []))} split PDFs...")
+                for pdf_file in split_result.get("split_files", []):
+                    filename = os.path.basename(pdf_file)
+                    gcs_path = f"{gcs_prefix}/split_pdfs/{filename}"
+                    upload_result = await loop.run_in_executor(
+                        None,
+                        functools.partial(uploader.upload_file, pdf_file, gcs_path, False)
+                    )
+                    upload_results.append(upload_result)
+                    if upload_result["status"] == "success":
+                        successful_uploads += 1
+                    else:
+                        failed_uploads += 1
+                
+                # Upload markdown files
+                logger.info(f"Job {job_id}: Uploading {len(markdown_result.get('markdown_files', []))} markdown files...")
+                for md_file in markdown_result.get("markdown_files", []):
+                    filename = os.path.basename(md_file)
+                    gcs_path = f"{gcs_prefix}/markdown/{filename}"
+                    upload_result = await loop.run_in_executor(
+                        None,
+                        functools.partial(uploader.upload_file, md_file, gcs_path, False)
+                    )
+                    upload_results.append(upload_result)
+                    if upload_result["status"] == "success":
+                        successful_uploads += 1
+                    else:
+                        failed_uploads += 1
+                
+                total_files = len(upload_results)
+                gcs_result = {
+                    "status": "success" if failed_uploads == 0 else "partial" if successful_uploads > 0 else "error",
+                    "total_files": total_files,
+                    "successful_uploads": successful_uploads,
+                    "failed_uploads": failed_uploads,
+                    "gcs_bucket": GCS_BUCKET,
+                    "gcs_prefix": gcs_prefix,
+                    "split_pdfs_path": f"gs://{GCS_BUCKET}/{gcs_prefix}/split_pdfs/",
+                    "markdown_path": f"gs://{GCS_BUCKET}/{gcs_prefix}/markdown/",
+                    "message": f"Uploaded {successful_uploads}/{total_files} files to gs://{GCS_BUCKET}/{gcs_prefix}",
+                    "uploads": upload_results
+                }
+                
+                result["gcs_upload"] = gcs_result
+                logger.info(f"Job {job_id}: GCS upload completed - {gcs_result['message']}")
+                
+            except Exception as gcs_error:
+                logger.error(f"Job {job_id}: GCS upload failed - {str(gcs_error)}")
+                result["gcs_upload"] = {
+                    "status": "error",
+                    "message": f"GCS upload failed: {str(gcs_error)}"
+                }
+        else:
+            logger.info(f"Job {job_id}: GCS upload skipped - GCS_BUCKET not configured")
+            result["gcs_upload"] = {
+                "status": "skipped",
+                "message": "GCS_BUCKET environment variable not set"
+            }
+
         # Update job status
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["result"] = result
-        jobs[job_id]["message"] = f"Processing completed: {result['summary']['successful_conversions']}/{result['summary']['total_gos_found']} GOs converted"
+        
+        # Update message to include GCS info if uploaded
+        message = f"Processing completed: {result['summary']['successful_conversions']}/{result['summary']['total_gos_found']} GOs converted"
+        if GCS_ENABLED and result.get("gcs_upload", {}).get("status") == "success":
+            message += f" | Uploaded to GCS: gs://{GCS_BUCKET}/{result['gcs_upload']['gcs_prefix']}"
+        
+        jobs[job_id]["message"] = message
         jobs[job_id]["updated_at"] = datetime.now().isoformat()
 
         logger.info(f"Job {job_id}: Completed successfully - {result['summary']}")
@@ -257,6 +355,8 @@ async def process_pdf_task_direct(job_id: str, pdf_path: str, output_dir: Option
                 logger.info(f"Cleaned up file after failure: {pdf_path}")
         except Exception as cleanup_error:
             logger.warning(f"Failed to clean up file after failure {pdf_path}: {cleanup_error}")
+
+
 
 
 
@@ -459,6 +559,7 @@ async def process_pdf_path_direct(
     """
     Process a PDF file from a file path using direct in-process calls (concurrent).
     This endpoint bypasses the ADK agent and directly calls the processing functions.
+    Automatically uploads results to GCS if GCS_BUCKET environment variable is set.
     Returns a job ID that can be used to check processing status.
     """
     # Validate file exists
@@ -472,12 +573,16 @@ async def process_pdf_path_direct(
     job_id = str(uuid.uuid4())
     
     # Create job entry
+    message = f"Job created, direct processing will start shortly (concurrent with {max_workers} workers)"
+    if GCS_ENABLED:
+        message += f" | Will auto-upload to GCS: {GCS_BUCKET}"
+    
     jobs[job_id] = {
         "job_id": job_id,
         "user_id": "direct",
         "session_id": "direct",
         "status": "pending",
-        "message": f"Job created, direct processing will start shortly (concurrent with {max_workers} workers)",
+        "message": message,
         "result": None,
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
@@ -497,6 +602,8 @@ async def process_pdf_path_direct(
     logger.info(f"Created direct processing job {job_id} for file {request.pdf_path}")
     
     return JobResponse(**jobs[job_id])
+
+
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
