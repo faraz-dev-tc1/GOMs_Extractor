@@ -15,6 +15,11 @@ from datetime import datetime
 import logging
 import httpx
 import asyncio
+import functools
+
+# Import the processing functions for direct in-process calls
+from goms_extractor.splitter import split_goms
+from goms_extractor.md_converter import convert_split_gos_to_markdown
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +44,7 @@ app.add_middleware(
 # Configuration
 ADK_API_URL = os.getenv("ADK_API_URL", "http://localhost:8000")
 APP_NAME = "goms_extraction_workflow_agent"
-UPLOAD_DIR = "/srv/documents"
+UPLOAD_DIR = "/tmp/documents"
 os.makedirs(UPLOAD_DIR, exist_ok=True)  # Requires directory to be created with proper permissions
 
 # HTTP client for ADK API
@@ -173,6 +178,88 @@ async def process_pdf_task(job_id: str, pdf_path: str, user_id: str, session_id:
             logger.warning(f"Failed to clean up file after failure {pdf_path}: {cleanup_error}")
 
 
+async def process_pdf_task_direct(job_id: str, pdf_path: str, output_dir: Optional[str] = None, max_workers: int = 4):
+    """
+    Background task to process PDF using direct in-process calls (concurrent).
+    This bypasses the ADK agent and directly calls split_goms and convert_split_gos_to_markdown.
+    """
+    try:
+        logger.info(f"Job {job_id}: Starting direct processing (concurrent with {max_workers} workers)")
+        jobs[job_id]["status"] = "processing"
+        jobs[job_id]["updated_at"] = datetime.now().isoformat()
+
+        # Step 1: Split the PDF into individual GOs
+        logger.info(f"Job {job_id}: Splitting PDF into individual GOs...")
+        loop = asyncio.get_event_loop()
+        split_result = await loop.run_in_executor(
+            None,
+            functools.partial(split_goms, input_pdf_path=pdf_path, output_dir=output_dir)
+        )
+        
+        if split_result.get("status") != "success":
+            raise Exception(f"Splitting failed: {split_result.get('message')}")
+        
+        logger.info(f"Job {job_id}: Split completed - {len(split_result.get('split_files', []))} files created")
+
+        # Step 2: Convert split PDFs to markdown (concurrent)
+        logger.info(f"Job {job_id}: Converting split PDFs to markdown (concurrent)...")
+        markdown_result = await loop.run_in_executor(
+            None,
+            functools.partial(
+                convert_split_gos_to_markdown, 
+                split_result=split_result, 
+                output_dir=output_dir,
+                max_workers=max_workers
+            )
+        )
+        
+        if markdown_result.get("status") != "success":
+            logger.warning(f"Job {job_id}: Markdown conversion had issues: {markdown_result.get('message')}")
+
+        # Combine results
+        result = {
+            "split_result": split_result,
+            "markdown_result": markdown_result,
+            "summary": {
+                "total_gos_found": len(split_result.get("split_files", [])),
+                "successful_conversions": len(markdown_result.get("markdown_files", [])),
+                "split_files": split_result.get("split_files", []),
+                "markdown_files": markdown_result.get("markdown_files", [])
+            }
+        }
+
+        # Update job status
+        jobs[job_id]["status"] = "completed"
+        jobs[job_id]["result"] = result
+        jobs[job_id]["message"] = f"Processing completed: {result['summary']['successful_conversions']}/{result['summary']['total_gos_found']} GOs converted"
+        jobs[job_id]["updated_at"] = datetime.now().isoformat()
+
+        logger.info(f"Job {job_id}: Completed successfully - {result['summary']}")
+
+        # Clean up the uploaded file after successful processing
+        try:
+            if os.path.exists(pdf_path) and pdf_path.startswith(UPLOAD_DIR):
+                os.remove(pdf_path)
+                logger.info(f"Cleaned up file: {pdf_path}")
+        except Exception as cleanup_error:
+            logger.warning(f"Failed to clean up file {pdf_path}: {cleanup_error}")
+
+    except Exception as e:
+        logger.error(f"Job {job_id}: Failed - {str(e)}", exc_info=True)
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["message"] = f"Processing failed: {str(e)}"
+        jobs[job_id]["updated_at"] = datetime.now().isoformat()
+
+        # Even in case of failure, try to clean up the file
+        try:
+            if os.path.exists(pdf_path) and pdf_path.startswith(UPLOAD_DIR):
+                os.remove(pdf_path)
+                logger.info(f"Cleaned up file after failure: {pdf_path}")
+        except Exception as cleanup_error:
+            logger.warning(f"Failed to clean up file after failure {pdf_path}: {cleanup_error}")
+
+
+
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
@@ -184,8 +271,10 @@ async def root():
         "app_name": APP_NAME,
         "endpoints": {
             "/health": "Health check",
-            "/process": "Process a PDF file (upload)",
-            "/process-path": "Process a PDF from file path",
+            "/process": "Process a PDF file (upload) via ADK agent",
+            "/process-path": "Process a PDF from file path via ADK agent",
+            "/process-direct": "Process a PDF file (upload) with direct concurrent processing",
+            "/process-path-direct": "Process a PDF from file path with direct concurrent processing",
             "/jobs/{job_id}": "Get job status",
             "/jobs": "List all jobs",
             "/adk/list-apps": "List ADK apps (passthrough)"
@@ -309,6 +398,103 @@ async def process_pdf_path(
     )
     
     logger.info(f"Created job {job_id} for file {request.pdf_path}")
+    
+    return JobResponse(**jobs[job_id])
+
+
+@app.post("/process-direct", response_model=JobResponse)
+async def process_pdf_upload_direct(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    max_workers: int = 4
+):
+    """
+    Upload and process a PDF file using direct in-process calls (concurrent).
+    This endpoint bypasses the ADK agent and directly calls the processing functions.
+    Returns a job ID that can be used to check processing status.
+    """
+    # Validate file type
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    # Generate IDs
+    job_id = str(uuid.uuid4())
+
+    # Save uploaded file to shared directory with unique name
+    file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+
+    # Create job entry
+    jobs[job_id] = {
+        "job_id": job_id,
+        "user_id": "direct",
+        "session_id": "direct",
+        "status": "pending",
+        "message": f"Job created, direct processing will start shortly (concurrent with {max_workers} workers)",
+        "result": None,
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+        "file_path": file_path,
+        "original_filename": file.filename
+    }
+
+    # Add background task for direct processing
+    background_tasks.add_task(process_pdf_task_direct, job_id, file_path, None, max_workers)
+
+    logger.info(f"Created direct processing job {job_id} for file {file.filename}")
+
+    return JobResponse(**jobs[job_id])
+
+
+@app.post("/process-path-direct", response_model=JobResponse)
+async def process_pdf_path_direct(
+    background_tasks: BackgroundTasks,
+    request: ProcessRequest,
+    max_workers: int = 4
+):
+    """
+    Process a PDF file from a file path using direct in-process calls (concurrent).
+    This endpoint bypasses the ADK agent and directly calls the processing functions.
+    Returns a job ID that can be used to check processing status.
+    """
+    # Validate file exists
+    if not os.path.exists(request.pdf_path):
+        raise HTTPException(status_code=404, detail=f"File not found: {request.pdf_path}")
+    
+    if not request.pdf_path.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+    
+    # Create job entry
+    jobs[job_id] = {
+        "job_id": job_id,
+        "user_id": "direct",
+        "session_id": "direct",
+        "status": "pending",
+        "message": f"Job created, direct processing will start shortly (concurrent with {max_workers} workers)",
+        "result": None,
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+        "file_path": request.pdf_path,
+        "original_filename": os.path.basename(request.pdf_path)
+    }
+    
+    # Add background task for direct processing
+    background_tasks.add_task(
+        process_pdf_task_direct,
+        job_id,
+        request.pdf_path,
+        request.output_dir,
+        max_workers
+    )
+    
+    logger.info(f"Created direct processing job {job_id} for file {request.pdf_path}")
     
     return JobResponse(**jobs[job_id])
 

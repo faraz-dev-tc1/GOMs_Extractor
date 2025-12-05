@@ -118,14 +118,16 @@ def convert_go_to_markdown(pdf_path: str, output_dir: Optional[str] = None) -> D
         }
 
 
-def convert_split_gos_to_markdown(split_result: Dict[str, Any], output_dir: Optional[str] = None) -> Dict[str, Any]:
+def convert_split_gos_to_markdown(split_result: Dict[str, Any], output_dir: Optional[str] = None, max_workers: int = 4) -> Dict[str, Any]:
     """
-    Convert all split GO PDFs to markdown files.
+    Convert all split GO PDFs to markdown files concurrently.
     
     Args:
         split_result: Result dictionary from split_goms function containing:
             - split_files: List of paths to split PDF files
             - go_index: List of GO information
+        output_dir: Optional output directory for markdown files
+        max_workers: Maximum number of concurrent workers (default: 4)
     
     Returns:
         Dictionary containing:
@@ -136,7 +138,7 @@ def convert_split_gos_to_markdown(split_result: Dict[str, Any], output_dir: Opti
             "conversion_results": List of individual conversion results
         }
     """
-    print(f"DEBUG: Converting split GOs to markdown...")
+    print(f"DEBUG: Converting split GOs to markdown (concurrent with {max_workers} workers)...")
     
     if split_result.get("status") != "success":
         return {
@@ -157,19 +159,44 @@ def convert_split_gos_to_markdown(split_result: Dict[str, Any], output_dir: Opti
     
     print(f"DEBUG: Found {len(split_files)} split files to convert")
     
-    markdown_files = []
-    conversion_results = []
+    # Use ThreadPoolExecutor for concurrent processing
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     
-    for i, pdf_path in enumerate(split_files, 1):
-        print(f"\nConverting file {i}/{len(split_files)}: {os.path.basename(pdf_path)}")
-        result = convert_go_to_markdown(pdf_path)
-        conversion_results.append(result)
+    markdown_files = []
+    conversion_results = [None] * len(split_files)  # Preserve order
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all conversion tasks
+        future_to_index = {
+            executor.submit(convert_go_to_markdown, pdf_path, output_dir): (i, pdf_path)
+            for i, pdf_path in enumerate(split_files)
+        }
         
-        if result["status"] == "success":
-            markdown_files.append(result["markdown_path"])
-            print(f"  ✓ Converted to: {os.path.basename(result['markdown_path'])}")
-        else:
-            print(f"  ✗ Conversion failed: {result['message']}")
+        # Process results as they complete
+        completed = 0
+        for future in as_completed(future_to_index):
+            i, pdf_path = future_to_index[future]
+            completed += 1
+            
+            try:
+                result = future.result()
+                conversion_results[i] = result
+                
+                print(f"\nCompleted {completed}/{len(split_files)}: {os.path.basename(pdf_path)}")
+                
+                if result["status"] == "success":
+                    markdown_files.append(result["markdown_path"])
+                    print(f"  ✓ Converted to: {os.path.basename(result['markdown_path'])}")
+                else:
+                    print(f"  ✗ Conversion failed: {result['message']}")
+            except Exception as e:
+                print(f"  ✗ Exception during conversion: {str(e)}")
+                conversion_results[i] = {
+                    "status": "error",
+                    "message": f"Exception during conversion: {str(e)}",
+                    "markdown_path": None,
+                    "goms_no": None
+                }
     
     successful_conversions = len(markdown_files)
     total_files = len(split_files)
@@ -188,7 +215,7 @@ def convert_split_gos_to_markdown(split_result: Dict[str, Any], output_dir: Opti
     
     return {
         "status": "success",
-        "message": f"Successfully converted {successful_conversions}/{total_files} GO PDFs to markdown",
+        "message": f"Successfully converted {successful_conversions}/{total_files} GO PDFs to markdown (concurrent processing)",
         "markdown_files": markdown_files,
         "conversion_results": conversion_results
     }

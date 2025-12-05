@@ -1,6 +1,7 @@
 from google.adk.agents import LlmAgent, SequentialAgent
 from goms_extractor.splitter import split_goms
 from goms_extractor.md_converter import convert_split_gos_to_markdown
+from google.adk.apps import App
 import logging
 
 # Set up logging to see detailed output
@@ -71,3 +72,8 @@ workflow_agent = SequentialAgent(
 )
 
 root_agent = workflow_agent
+
+app = App(
+    name="goms_extractor",
+    root_agent=root_agent,
+)
