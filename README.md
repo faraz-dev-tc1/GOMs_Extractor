@@ -13,6 +13,34 @@ This project processes Government Orders from Andhra Pradesh and other states by
 
 The system is built with a modular architecture using FastAPI for the API gateway and Google Cloud Storage for document persistence.
 
+## Quick Start
+
+Get started in 3 simple steps using Docker:
+
+```bash
+# 1. Clone and navigate to the project
+git clone <repository-url>
+cd goms
+
+# 2. Configure environment (optional - works with local storage by default)
+cp .env.example .env
+# Edit .env if you want to use Google Cloud Storage
+
+# 3. Run with Docker Compose
+docker compose up --build
+```
+
+The API will be available at `http://localhost:8080/docs`
+
+**Test the API:**
+```bash
+# Upload and process a PDF
+curl -X POST "http://localhost:8080/process-direct" \
+  -F "file=@/path/to/your/document.pdf"
+```
+
+For detailed setup and configuration, see the [Installation](#installation) section below.
+
 ## Architecture
 
 ```
@@ -65,53 +93,152 @@ goms/
 
 ## Prerequisites
 
-- Python 3.8+
+### For Docker Deployment (Recommended)
+- Docker Engine 20.10+
+- Docker Compose V2
+- Google Cloud Project with:
+  - Google Cloud Storage bucket (optional, for cloud storage)
+  - Service account with GCS permissions (if using GCS)
+
+### For Local Development
+- Python 3.12+
 - Google Cloud Project with:
   - Google Cloud Storage bucket
   - Service account with GCS permissions
   - Application Default Credentials configured
-- FastAPI and dependencies
+- System dependencies:
+  - ocrmypdf
+  - tesseract-ocr
+  - ghostscript
 
 ## Installation
 
-### 1. Clone or Download the Project
+### Option 1: Docker Deployment (Recommended)
+
+#### 1. Clone the Project
 
 ```bash
-cd /home/faraz/workspace/goms
+git clone <repository-url>
+cd goms
 ```
 
-### 2. Create Virtual Environment
+#### 2. Configure Environment Variables
+
+Copy the example environment file and configure it:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your configuration:
+
+```bash
+# Google Cloud Configuration
+GOOGLE_CLOUD_PROJECT=your-project-id
+GOOGLE_CLOUD_REGION=us-central1
+
+# GCS Configuration (optional - will use local storage if not set)
+GCS_BUCKET=your-bucket-name
+GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
+
+# API Configuration
+API_HOST=0.0.0.0
+API_PORT=8080
+LOG_LEVEL=INFO
+MAX_WORKERS=4
+
+# ADK API Configuration (if using agent-based processing)
+ADK_API_URL=http://localhost:8000
+```
+
+#### 3. Set Up Google Cloud Credentials (Optional)
+
+If using GCS, uncomment the credentials volume mount in `docker-compose.yml`:
+
+```yaml
+volumes:
+  # Uncomment and set the path to your service account JSON file
+  - /path/to/your/service-account.json:/app/credentials/service-account.json:ro
+```
+
+#### 4. Build and Run with Docker Compose
+
+```bash
+# Build and start the service
+docker compose up --build
+
+# Or run in detached mode
+docker compose up -d --build
+```
+
+The API will be available at `http://localhost:8080`
+
+#### 5. View Logs
+
+```bash
+# View logs
+docker compose logs -f goms-api
+
+# View specific number of log lines
+docker compose logs --tail=100 goms-api
+```
+
+#### 6. Stop the Service
+
+```bash
+# Stop and remove containers
+docker compose down
+
+# Stop, remove containers, and remove volumes
+docker compose down -v
+```
+
+### Option 2: Local Development Setup
+
+#### 1. Clone the Project
+
+```bash
+git clone <repository-url>
+cd goms
+```
+
+#### 2. Install System Dependencies
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get update
+sudo apt-get install -y ocrmypdf tesseract-ocr tesseract-ocr-eng ghostscript
+```
+
+**macOS:**
+```bash
+brew install ocrmypdf tesseract ghostscript
+```
+
+#### 3. Create Virtual Environment
 
 ```bash
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 ```
 
-### 3. Install Dependencies
+#### 4. Install Python Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Configure Environment Variables
+#### 5. Configure Environment Variables
 
-Create a `.env` file in the project root with the following variables:
+Create a `.env` file in the project root:
 
 ```bash
-# Google Cloud Configuration
-GOOGLE_CLOUD_PROJECT=your-project-id
-GOOGLE_CLOUD_LOCATION=us-central1
-
-# GCS Configuration (REQUIRED)
-GCS_BUCKET=your-bucket-name
-GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
-
-# Optional: ADK API Configuration
-ADK_API_URL=http://localhost:8000
-UPLOAD_DIR=/tmp/documents
+cp .env.example .env
 ```
 
-### 5. Set Up Google Cloud Authentication
+Edit the `.env` file with your configuration (see `.env.example` for all available options).
+
+#### 6. Set Up Google Cloud Authentication
 
 ```bash
 # Authenticate with Google Cloud
@@ -123,19 +250,28 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
 
 ## Running the Application
 
-### Start the API Server
+### With Docker (Recommended)
+
+```bash
+docker compose up
+```
+
+The API will be available at `http://localhost:8080`
+
+### Local Development
 
 ```bash
 # From the project root
-python src/api.py
+python -m uvicorn src.api:app --host 0.0.0.0 --port 8080 --reload
 ```
 
-The API will be available at `http://localhost:8000`
+The API will be available at `http://localhost:8080`
 
 ### Access API Documentation
 
-- **Swagger UI**: `http://localhost:8000/docs`
-- **ReDoc**: `http://localhost:8000/redoc`
+- **Swagger UI**: `http://localhost:8080/docs`
+- **ReDoc**: `http://localhost:8080/redoc`
+- **Health Check**: `http://localhost:8080/health`
 
 ## API Endpoints
 
@@ -147,7 +283,7 @@ Upload a PDF file and process it immediately with concurrent conversion.
 
 **Request**:
 ```bash
-curl -X POST "http://localhost:8000/process-direct" \
+curl -X POST "http://localhost:8080/process-direct" \
   -F "file=@/path/to/document.pdf" \
   -F "max_workers=4"
 ```
@@ -172,7 +308,7 @@ Process a PDF from a file system path.
 
 **Request**:
 ```bash
-curl -X POST "http://localhost:8000/process-path-direct" \
+curl -X POST "http://localhost:8080/process-path-direct" \
   -H "Content-Type: application/json" \
   -d "{
     \"pdf_path\": \"/path/to/document.pdf\",
@@ -189,7 +325,7 @@ Check the status and results of a processing job.
 
 **Request**:
 ```bash
-curl "http://localhost:8000/job-status/uuid-string"
+curl "http://localhost:8080/job-status/uuid-string"
 ```
 
 **Response**:
@@ -222,14 +358,30 @@ Get a list of all processing jobs.
 
 **Request**:
 ```bash
-curl "http://localhost:8000/jobs"
+curl "http://localhost:8080/jobs"
 ```
 
-### 5. API Info
+### 5. Health Check
+
+**Endpoint**: `GET /health`
+
+Check if the API is running and healthy.
+
+**Request**:
+```bash
+curl "http://localhost:8080/health"
+```
+
+### 6. API Info
 
 **Endpoint**: `GET /`
 
 Get API information and configuration details.
+
+**Request**:
+```bash
+curl "http://localhost:8080/"
+```
 
 ## Configuration
 
@@ -301,14 +453,62 @@ logging.basicConfig(level=logging.DEBUG)  # For more verbose output
 
 ## Troubleshooting
 
+### Docker-Specific Issues
+
+#### Container Won't Start
+
+**Error**: Container exits immediately or fails health check
+
+**Solution**:
+1. Check logs: `docker compose logs goms-api`
+2. Verify `.env` file exists and is properly configured
+3. Ensure port 8080 is not already in use: `lsof -i :8080`
+4. Check Docker daemon is running: `docker ps`
+
+#### Permission Issues with Volumes
+
+**Error**: Permission denied when writing to mounted volumes
+
+**Solution**:
+```bash
+# Fix permissions on output directory
+sudo chown -R $USER:$USER ./outputs
+
+# Or run with appropriate user in docker-compose.yml
+user: "${UID}:${GID}"
+```
+
+#### GCS Credentials Not Found
+
+**Error**: `GOOGLE_APPLICATION_CREDENTIALS` file not found in container
+
+**Solution**:
+1. Verify the credentials file exists on your host system
+2. Update the volume mount path in `docker-compose.yml`:
+   ```yaml
+   volumes:
+     - /absolute/path/to/service-account.json:/app/credentials/service-account.json:ro
+   ```
+3. Ensure the path in `.env` matches the container path:
+   ```bash
+   GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
+   ```
+
+### General Issues
+
 ### GCS_BUCKET is None
 
 **Error**: `GCS_BUCKET is set to: None`
 
 **Solution**: 
 1. Verify `.env` file has `GCS_BUCKET=your-bucket-name`
-2. Load environment variables before running: `source .env`
-3. Or pass as environment variable: `GCS_BUCKET=your-bucket-name python src/api.py`
+2. For Docker: Restart the container after updating `.env`
+   ```bash
+   docker compose down
+   docker compose up -d
+   ```
+3. For local: Load environment variables: `source .env`
+4. Or pass as environment variable: `GCS_BUCKET=your-bucket-name python src/api.py`
 
 ### Permission Denied for GCS
 
@@ -316,8 +516,9 @@ logging.basicConfig(level=logging.DEBUG)  # For more verbose output
 
 **Solution**:
 1. Verify service account has GCS permissions
-2. Run `gcloud auth application-default login`
-3. Check `GOOGLE_APPLICATION_CREDENTIALS` path is correct
+2. For local development: Run `gcloud auth application-default login`
+3. For Docker: Ensure credentials file is properly mounted
+4. Check `GOOGLE_APPLICATION_CREDENTIALS` path is correct
 
 ### PDF Conversion Failures
 
@@ -326,24 +527,143 @@ logging.basicConfig(level=logging.DEBUG)  # For more verbose output
 **Solution**:
 1. Check logs for detailed error messages
 2. Verify PDF is not corrupted
-3. Increase `max_workers` if resources allow
-4. Check available disk space in `/tmp/documents`
+3. Increase `max_workers` if resources allow (default: 4)
+4. Check available disk space:
+   - Docker: `docker system df`
+   - Local: `df -h /tmp/documents`
+5. For Docker: Check container resources:
+   ```bash
+   docker stats goms-extraction-api
+   ```
+
+### Port Already in Use
+
+**Error**: `Address already in use` or port binding error
+
+**Solution**:
+1. Check what's using port 8080:
+   ```bash
+   lsof -i :8080
+   # or
+   netstat -tuln | grep 8080
+   ```
+2. Stop the conflicting service or change the port in `docker-compose.yml`:
+   ```yaml
+   ports:
+     - "8081:8080"  # Use port 8081 on host
+   ```
 
 ## Development
 
-### Running Tests
+### Docker Development Workflow
+
+#### Rebuilding After Code Changes
 
 ```bash
+# Rebuild and restart the container
+docker compose up --build
+
+# Or rebuild without cache
+docker compose build --no-cache
+docker compose up
+```
+
+#### Accessing the Container Shell
+
+```bash
+# Open a shell in the running container
+docker compose exec goms-api bash
+
+# Or start a new container with shell
+docker compose run --rm goms-api bash
+```
+
+#### Viewing Real-time Logs
+
+```bash
+# Follow logs from all services
+docker compose logs -f
+
+# Follow logs from specific service
+docker compose logs -f goms-api
+
+# View last 100 lines
+docker compose logs --tail=100 goms-api
+```
+
+#### Running Tests in Docker
+
+```bash
+# Run tests in the container
+docker compose exec goms-api pytest tests/
+
+# Run specific test file
+docker compose exec goms-api pytest tests/test_splitter.py
+
+# Run with coverage
+docker compose exec goms-api pytest --cov=goms_extractor tests/
+```
+
+### Local Development Workflow
+
+#### Running Tests Locally
+
+```bash
+# Activate virtual environment
+source venv/bin/activate
+
+# Run all tests
 pytest tests/
+
+# Run with coverage
+pytest --cov=goms_extractor --cov=src tests/
+
+# Run specific test file
+pytest tests/test_splitter.py -v
+```
+
+#### Hot Reload for Development
+
+```bash
+# Run with auto-reload on code changes
+python -m uvicorn src.api:app --host 0.0.0.0 --port 8080 --reload
 ```
 
 ### Code Structure
 
-- **splitter.py**: PDF splitting using PyPDF2
-- **md_converter.py**: PDF to markdown conversion with Claude
+- **splitter.py**: PDF splitting using regex-based page analysis
+- **md_converter.py**: PDF to markdown conversion with OCR
 - **gcs_storage.py**: Google Cloud Storage operations
 - **models.py**: Pydantic data models
 - **token_tracker.py**: Token usage tracking for API calls
+- **api.py**: FastAPI application and endpoints
+
+### Adding New Features
+
+1. **Create a new branch**:
+   ```bash
+   git checkout -b feature/your-feature-name
+   ```
+
+2. **Make your changes** in the appropriate module
+
+3. **Test locally**:
+   ```bash
+   # Test with Docker
+   docker compose up --build
+   
+   # Or test locally
+   pytest tests/
+   ```
+
+4. **Update documentation** in README.md if needed
+
+5. **Commit and push**:
+   ```bash
+   git add .
+   git commit -m "Add: your feature description"
+   git push origin feature/your-feature-name
+   ```
 
 ## Performance Considerations
 
@@ -361,15 +681,49 @@ pytest tests/
 
 ## Dependencies
 
-Key dependencies:
-- `fastapi` - Web framework
-- `google-cloud-storage` - GCS client
-- `google-adk` - ADK integration
-- `pydantic` - Data validation
-- `httpx` - Async HTTP client
-- `python-dotenv` - Environment configuration
+### Docker Image
 
-See `requirements.txt` for complete list.
+The Docker image is based on `python:3.12-slim` and includes:
+
+**System Dependencies:**
+- `ocrmypdf` - OCR processing for PDFs
+- `tesseract-ocr` - OCR engine
+- `tesseract-ocr-eng` - English language data for Tesseract
+- `ghostscript` - PDF rendering and manipulation
+- `libimage-exiftool-perl` - Image metadata extraction
+
+**Python Dependencies:**
+
+Key dependencies (see `requirements.txt` for complete list):
+- `fastapi` - Web framework for building APIs
+- `uvicorn` - ASGI server for running FastAPI
+- `google-cloud-storage` - GCS client library
+- `google-adk` - Google ADK integration
+- `pydantic` - Data validation and settings management
+- `httpx` - Async HTTP client
+- `python-dotenv` - Environment variable management
+- `pdfplumber` - PDF text extraction
+- `ocrmypdf` - PDF OCR processing
+- `PyPDF2` - PDF manipulation
+
+### Installing Dependencies Locally
+
+For local development without Docker:
+
+**System Dependencies:**
+```bash
+# Ubuntu/Debian
+sudo apt-get update
+sudo apt-get install -y ocrmypdf tesseract-ocr tesseract-ocr-eng ghostscript
+
+# macOS
+brew install ocrmypdf tesseract ghostscript
+```
+
+**Python Dependencies:**
+```bash
+pip install -r requirements.txt
+```
 
 ## Contributing
 
