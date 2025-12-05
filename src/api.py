@@ -18,6 +18,10 @@ import asyncio
 import functools
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -28,6 +32,9 @@ from goms_extractor.md_converter import convert_split_gos_to_markdown
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+GCS_BUCKET = os.getenv("GCS_BUCKET")  # Set via environment variable
+print(f"GCS_BUCKET is set to: {GCS_BUCKET}")
 
 # Create FastAPI app
 app = FastAPI(
@@ -52,7 +59,7 @@ UPLOAD_DIR = "/tmp/documents"
 os.makedirs(UPLOAD_DIR, exist_ok=True)  # Requires directory to be created with proper permissions
 
 # GCS Configuration
-GCS_BUCKET = os.getenv("GCS_BUCKET")  # Set via environment variable
+
 GCS_ENABLED = GCS_BUCKET is not None
 
 # HTTP client for ADK API
@@ -314,11 +321,18 @@ async def process_pdf_task_direct(
                     "message": f"GCS upload failed: {str(gcs_error)}"
                 }
         else:
-            logger.info(f"Job {job_id}: GCS upload skipped - GCS_BUCKET not configured")
+            logger.critical(f"Job {job_id}: CRITICAL - GCS upload FAILED - GCS_BUCKET environment variable not configured. This is a required configuration for document storage.")
             result["gcs_upload"] = {
-                "status": "skipped",
-                "message": "GCS_BUCKET environment variable not set"
+                "status": "error",
+                "message": "GCS_BUCKET environment variable not set - Document storage is required but not configured"
             }
+            # Mark job as failed since GCS upload is mandatory
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["result"] = result
+            jobs[job_id]["message"] = f"Processing failed: GCS storage is required but GCS_BUCKET is not configured"
+            jobs[job_id]["updated_at"] = datetime.now().isoformat()
+            logger.error(f"Job {job_id}: Failed due to missing GCS configuration")
+            return
 
         # Update job status
         jobs[job_id]["status"] = "completed"
@@ -513,6 +527,14 @@ async def process_pdf_upload_direct(
     This endpoint bypasses the ADK agent and directly calls the processing functions.
     Returns a job ID that can be used to check processing status.
     """
+    # Validate GCS configuration first
+    if not GCS_ENABLED:
+        logger.critical("CRITICAL: GCS_BUCKET environment variable is not configured. Document storage is required.")
+        raise HTTPException(
+            status_code=503,
+            detail="GCS storage is not configured. Please set the GCS_BUCKET environment variable. Document storage is a required service."
+        )
+    
     # Validate file type
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -562,6 +584,14 @@ async def process_pdf_path_direct(
     Automatically uploads results to GCS if GCS_BUCKET environment variable is set.
     Returns a job ID that can be used to check processing status.
     """
+    # Validate GCS configuration first
+    if not GCS_ENABLED:
+        logger.critical("CRITICAL: GCS_BUCKET environment variable is not configured. Document storage is required.")
+        raise HTTPException(
+            status_code=503,
+            detail="GCS storage is not configured. Please set the GCS_BUCKET environment variable. Document storage is a required service."
+        )
+    
     # Validate file exists
     if not os.path.exists(request.pdf_path):
         raise HTTPException(status_code=404, detail=f"File not found: {request.pdf_path}")
